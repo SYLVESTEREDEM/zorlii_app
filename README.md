@@ -15,7 +15,7 @@ py -m uvicorn zorlii_app.main:app --host 0.0.0.0 --port 8000
 
 Open the web client at `http://127.0.0.1:8000/` and interactive API docs at `http://127.0.0.1:8000/docs`. `0.0.0.0` is used so a phone on the same network can reach the API; do not expose this development server directly to the public internet.
 
-The default SQLite file is `zorlii_app\data\zorlii.sqlite3`. Set `ZORLII_DB_PATH` to use another file. Startup migrations are additive (`CREATE TABLE IF NOT EXISTS`, plus a username column/backfill for pre-existing accounts); they do not drop tables, delete profiles, or reset user content. Back up the DB before deployment or upgrades.
+The default SQLite file is `zorlii_app\data\zorlii.sqlite3`. Set `ZORLII_DB_PATH` to use another file. Profile photos are normalized to JPEG and stored in an `avatars` directory beside the configured database. Keep both the database and that directory on persistent storage; for Railway, mount the volume at `/data` and set `ZORLII_DB_PATH=/data/zorlii.sqlite3` so photos are stored in `/data/avatars`. No external image-storage credentials are needed. Startup migrations are additive (`CREATE TABLE IF NOT EXISTS`, plus the existing username column/backfill and a profile-photo column for pre-existing accounts); they do not drop tables, delete profiles, or reset user content. Back up the DB and avatar directory before deployment or upgrades.
 
 ## Email verification and password recovery
 
@@ -40,7 +40,7 @@ Set that value as `ZORLII_OTP_SECRET`. For Railway Free, Trial, or Hobby plans, 
 
 ## Expo mobile client
 
-The Expo source is in `zorlii_app\mobile`. It stores bearer sessions with Expo SecureStore and supports email-verified sign-up, OTP password recovery, sign-in, Pulse, posting, reactions, bookmarks, replies, search, follow, follower/following lists, notifications, private conversations, profile/consent settings, and local extractive assistance.
+The Expo source is in `zorlii_app\mobile`. It stores bearer sessions with Expo SecureStore and supports email-verified sign-up, OTP password recovery, sign-in, Pulse, posting, reactions, bookmarks, replies, search, follow, follower/following lists, notifications, private conversations, profile-photo selection/change/removal, profile/consent settings, and local extractive assistance.
 
 Use Node.js 22.13 or newer for the current Expo SDK. An Android APK can be built locally with the Android SDK installed, or through EAS Build. The project includes `eas.json` profiles for an internal-test APK and a production Android App Bundle.
 
@@ -76,7 +76,7 @@ For an EAS cloud preview APK instead, sign in with an Expo account, set `EXPO_PU
 ## API overview
 
 - `POST /api/auth/register`, `/register/resend`, `/register/verify`, `/login`, `/logout`, `/forgot-password`, `/reset-password`; `/api/me`
-- `GET/PATCH /api/profile`; `GET /api/users/{username}`, `/posts`, `/followers`, and `/following`; `POST /api/users/{username}/follow`
+- `GET/PATCH /api/profile`; `PUT/DELETE /api/profile/avatar`; `GET /api/avatars/{user_id}`; `GET /api/users/{username}`, `/posts`, `/followers`, and `/following`; `POST /api/users/{username}/follow`
 - `GET /api/feed?scope=all|following|bookmarks`; `POST /api/posts`; post read/delete and reply/reaction/bookmark actions
 - `GET/POST /api/conversations`; participant-only message read/send/edit/delete
 - `GET /api/search?q=...`; `GET /api/notifications`, `PATCH /api/notifications/{id}/read`, and `POST /api/notifications/read`; `GET /api/recommendations`
@@ -98,7 +98,7 @@ cd .\zorlii_app\mobile
 npm run typecheck
 ```
 
-API tests inject in-memory mail senders; they do not contact SMTP or expose codes in responses. Live delivery remains unverified until you configure working provider credentials. UI tests cover verification and OTP recovery affordances and prevent regression to link-only recovery.
+API tests inject in-memory mail senders; they do not contact SMTP or expose codes in responses. Avatar tests exercise format validation, size limits, persistence, ownership, replacement, removal, and deletion cleanup. UI tests cover OTP recovery, profile-photo controls, real-data empty states, and local-assistance consent affordances.
 
 ## MVP boundaries
 

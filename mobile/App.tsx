@@ -4,14 +4,15 @@ import {
   ScrollView, Share, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import * as SecureStore from "expo-secure-store";
+import * as ImagePicker from "expo-image-picker";
 import { StatusBar } from "expo-status-bar";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
-type User = { id: number; username: string; email: string; display_name: string; bio: string; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean };
-type Post = { id: number; body: string; created_at: string; reaction_count: number; reply_count: number; reacted: boolean; bookmarked: boolean; author: { id: number; username: string; display_name: string } };
-type Conversation = { id: number; last_message?: string; participants: { username: string; display_name: string }[] };
-type Member = { id: number; username: string; display_name: string; bio: string };
-type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction"; post_id: number | null; created_at: string; read: boolean; actor: { username: string; display_name: string } };
+type User = { id: number; username: string; email: string; display_name: string; bio: string; avatar_url: string | null; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean };
+type Post = { id: number; body: string; created_at: string; reaction_count: number; reply_count: number; reacted: boolean; bookmarked: boolean; author: { id: number; username: string; display_name: string; avatar_url?: string | null } };
+type Conversation = { id: number; last_message?: string; participants: { id: number; username: string; display_name: string; avatar_url?: string | null }[] };
+type Member = { id: number; username: string; display_name: string; bio: string; avatar_url?: string | null };
+type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction"; post_id: number | null; created_at: string; read: boolean; actor: { username: string; display_name: string; avatar_url?: string | null } };
 
 function passwordPolicyError(password: string) {
   if (password.length < 4 || password.length > 128) return "Use 4–128 characters.";
@@ -20,6 +21,36 @@ function passwordPolicyError(password: string) {
   if (!/[0-9]/.test(password)) return "Add at least one number.";
   if (!/[^A-Za-z0-9\s]/.test(password)) return "Add at least one special character.";
   return "";
+}
+
+function BrandHalo({ size = 48, showLogo = false }: { size?: number; showLogo?: boolean }) {
+  return <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
+    style={[styles.brandHaloWrap, { width: size + 14, height: size + 14, borderRadius: (size + 14) / 2 }]}>
+    <View style={[styles.brandHaloRing, { width: size + 8, height: size + 8, borderRadius: (size + 8) / 2 }]}>
+      <View style={[styles.brandCore, { width: size, height: size, borderRadius: size / 2 }]}>
+        {showLogo
+          ? <Image source={require("./assets/zorlii-logo.png")} style={[styles.logo, { width: size, height: size, borderRadius: size / 2 }]} resizeMode="contain" />
+          : <Text style={[styles.brandMonogram, { fontSize: size * 0.43 }]}>Z</Text>}
+      </View>
+    </View>
+    <View style={styles.brandPulse} />
+  </View>;
+}
+
+function Avatar({ user, size = 42 }: { user?: { display_name?: string; username?: string; avatar_url?: string | null } | null; size?: number }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const name = user?.display_name || user?.username || "Zorlii member";
+  const initials = name.trim().split(/\s+/).slice(0, 2).map(part => part[0] || "").join("").toUpperCase() || "Z";
+  useEffect(() => { setImageFailed(false); }, [user?.avatar_url]);
+  return <View accessible accessibilityRole="image" accessibilityLabel={user?.avatar_url && !imageFailed ? `${name} profile photo` : `${initials} initials`}
+    style={[styles.avatarHalo, { width: size + 10, height: size + 10, borderRadius: (size + 10) / 2 }]}>
+    <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2 }]}>
+      {user?.avatar_url && !imageFailed
+        ? <Image source={{ uri: `${API_URL}${user.avatar_url}` }} style={styles.avatarImage} onError={() => setImageFailed(true)} />
+        : <Text style={styles.avatarInitials}>{initials}</Text>}
+    </View>
+    <View style={styles.avatarPulse} />
+  </View>;
 }
 
 export default function App() {
@@ -86,6 +117,45 @@ export default function App() {
       setFollowingCount(followingData.count);
     }
     catch (e) { fail(e); }
+  }
+  async function pickAvatar() {
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Photo access needed", "Allow photo-library access to choose a profile photo.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"], allowsEditing: true, aspect: [1, 1], quality: 0.85, base64: true,
+      });
+      if (result.canceled) return;
+      const asset = result.assets[0];
+      const contentType = asset.mimeType?.toLowerCase() || "image/jpeg";
+      if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
+        throw new Error("Choose a JPEG, PNG, or WebP image.");
+      }
+      if ((asset.fileSize && asset.fileSize > 2 * 1024 * 1024)
+        || (asset.base64 && asset.base64.length > Math.ceil((2 * 1024 * 1024) * 4 / 3))) {
+        throw new Error("Profile photos must be 2 MB or smaller.");
+      }
+      if (!asset.base64) throw new Error("Could not read that photo. Please choose another.");
+      await request("/api/profile/avatar", "PUT", {
+        content_type: contentType, image_base64: asset.base64,
+      });
+      setMe((await request("/api/me")).user);
+      Alert.alert("Photo updated", "Your profile photo is ready.");
+    } catch (e) { fail(e); }
+  }
+  function confirmAvatarRemoval() {
+    Alert.alert("Remove profile photo?", "Your initials will appear instead.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Remove photo", style: "destructive", onPress: async () => {
+        try {
+          await request("/api/profile/avatar", "DELETE");
+          setMe((await request("/api/me")).user);
+        } catch (e) { fail(e); }
+      } },
+    ]);
   }
   async function loadNotifications() {
     setLoading(true);
@@ -244,7 +314,7 @@ export default function App() {
     }}><Text style={[styles.tab, screen.startsWith(item) && styles.activeTab]}>{item === "feed" ? "Pulse" : item === "notifications" ? `Notifications${unreadNotifications ? ` · ${unreadNotifications}` : ""}` : item[0].toUpperCase() + item.slice(1)}</Text></Pressable>)}
   </View>;
   const postCard = (post: Post) => <View key={post.id} style={styles.post}>
-    <Text style={styles.author}>{post.author.display_name} <Text style={styles.handle}>@{post.author.username}</Text></Text>
+    <View style={styles.postAuthor}><Avatar user={post.author} /><View><Text style={styles.author}>{post.author.display_name}</Text><Text style={styles.handle}>@{post.author.username}</Text></View></View>
     <Text style={styles.postBody}>{post.body}</Text>
     <View style={styles.actions}>
       {button(`${post.reacted ? "♥" : "♡"} ${post.reaction_count}`, () => togglePost(post, "reaction"), true)}
@@ -342,12 +412,12 @@ export default function App() {
       </View>
       {loading ? <ActivityIndicator color="#7864bc" style={{ margin: 20 }} /> : null}
       {notifications.map(item => <View key={item.id} style={[styles.post, !item.read && styles.unreadNotification]}>
-        <Text style={styles.author}>{item.actor.display_name} <Text style={styles.handle}>@{item.actor.username}</Text></Text>
+        <View style={styles.postAuthor}><Avatar user={item.actor} size={38} /><View><Text style={styles.author}>{item.actor.display_name}</Text><Text style={styles.handle}>@{item.actor.username}</Text></View></View>
         <Text style={styles.copy}>{item.kind === "follow" ? "started following you." : item.kind === "reply" ? "replied to your post." : "reacted to your post."}</Text>
         <Text style={styles.handle}>{item.created_at}</Text>
         {!item.read ? button("Mark as read", () => markNotificationRead(item.id), true) : <Text style={styles.handle}>Read</Text>}
       </View>)}
-      {!loading && !notifications.length ? <View style={styles.empty}><Text style={styles.section}>You’re all caught up.</Text><Text style={styles.copy}>New activity from members will appear here.</Text></View> : null}
+      {!loading && !notifications.length ? <View style={styles.empty}><BrandHalo size={54} /><Text style={styles.section}>You’re all caught up.</Text><Text style={styles.copy}>New activity from members will appear here.</Text></View> : null}
     </View>;
     if (screen === "explore") return <View>
       <Text style={styles.title}>Explore</Text><Text style={styles.copy}>Search real member profiles and public posts.</Text>
@@ -355,7 +425,7 @@ export default function App() {
       {button("Search", async () => { try { setSearch(await request(`/api/search?q=${encodeURIComponent(form.query || "")}`)); } catch (e) { fail(e); } })}
       {search ? <View>
         <Text style={styles.section}>People</Text>{search.people.map((person: any) => <View key={person.id} style={styles.post}>
-          <Text style={styles.author}>{person.display_name} <Text style={styles.handle}>@{person.username}</Text></Text>
+          <View style={styles.postAuthor}><Avatar user={person} /><View><Text style={styles.author}>{person.display_name}</Text><Text style={styles.handle}>@{person.username}</Text></View></View>
           <Text style={styles.copy}>{person.bio || "A Zorlii member"}</Text>{button("Follow", async () => { try { await request(`/api/users/${person.username}/follow`, "POST"); } catch (e) { fail(e); } })}
           {button("Message", () => startConversation(person.username), true)}
         </View>)}
@@ -367,36 +437,39 @@ export default function App() {
       <Text style={styles.title}>Inbox</Text><Text style={styles.copy}>Private messages are visible only to conversation participants.</Text>
       {field("recipient", "Start with a username")}{button("Start conversation", () => startConversation(form.recipient || ""))}
       {conversations.map(c => <Pressable key={c.id} style={styles.post} onPress={() => loadConversation(c.id)}>
-        <Text style={styles.author}>{c.participants.map(p => p.display_name).join(", ")}</Text><Text style={styles.copy}>{c.last_message || "No messages yet"}</Text>
+        <View style={styles.postAuthor}>{c.participants.slice(0, 1).map(person => <Avatar key={person.id} user={person} size={38} />)}<View><Text style={styles.author}>{c.participants.map(p => p.display_name).join(", ")}</Text><Text style={styles.copy}>{c.last_message || "No messages yet"}</Text></View></View>
       </Pressable>)}
       {!conversations.length && <Text style={styles.copy}>Your inbox is quiet. Start a conversation when you’re ready.</Text>}
     </View>;
     if (screen === "messages") return <View>
       {button("‹ Inbox", loadInbox, true)}<Text style={styles.title}>Conversation</Text>
       <View style={styles.messageList}>{messages.map(m => <View key={m.id} style={styles.message}>
-        <Text style={styles.author}>{m.author.display_name}</Text><Text style={styles.copy}>{m.body}</Text>
+        <View style={styles.postAuthor}><Avatar user={m.author} size={32} /><Text style={styles.author}>{m.author.display_name}</Text></View><Text style={styles.copy}>{m.body}</Text>
       </View>)}</View>
       {field("message", "Write a message", false, true)}
       {button("Send", async () => { try { await request(`/api/conversations/${conversationId}/messages`, "POST", { body: form.message }); update("message", ""); setMessages((await request(`/api/conversations/${conversationId}/messages`)).messages); } catch (e) { fail(e); } })}
     </View>;
     if (screen === "profile") return <View>
-      <Text style={styles.title}>{me?.display_name || "Your profile"}</Text><Text style={styles.handle}>@{me?.username} · {me?.email}</Text>
+      <View style={styles.profileHero}><Avatar user={me} size={88} /><View style={{ flex: 1 }}><Text style={styles.title}>{me?.display_name || "Your profile"}</Text><Text style={styles.handle}>@{me?.username} · {me?.email}</Text></View></View>
+      {button(me?.avatar_url ? "Change profile photo" : "Add profile photo", pickAvatar, true)}
+      {me?.avatar_url ? button("Remove profile photo", confirmAvatarRemoval, true) : null}
+      <Text style={styles.copy}>Choose a JPEG, PNG, or WebP image up to 2 MB. Your photo appears with your profile and posts.</Text>
       <View style={styles.row}><Text style={styles.copy}>{followerCount} followers</Text><Text style={styles.copy}>{followingCount} following</Text></View>
       <Text style={styles.section}>Followers</Text>
       {followers.map(person => <View key={person.id} style={styles.relationshipRow}>
-        <Text style={styles.author}>{person.display_name} <Text style={styles.handle}>@{person.username}</Text></Text>
+        <View style={styles.postAuthor}><Avatar user={person} size={36} /><View><Text style={styles.author}>{person.display_name}</Text><Text style={styles.handle}>@{person.username}</Text></View></View>
         {person.bio ? <Text style={styles.copy}>{person.bio}</Text> : null}
       </View>)}
       {!followers.length ? <Text style={styles.copy}>No followers yet.</Text> : null}
       <Text style={styles.section}>Following</Text>
       {following.map(person => <View key={person.id} style={styles.relationshipRow}>
-        <Text style={styles.author}>{person.display_name} <Text style={styles.handle}>@{person.username}</Text></Text>
+        <View style={styles.postAuthor}><Avatar user={person} size={36} /><View><Text style={styles.author}>{person.display_name}</Text><Text style={styles.handle}>@{person.username}</Text></View></View>
         {person.bio ? <Text style={styles.copy}>{person.bio}</Text> : null}
       </View>)}
       {!following.length ? <Text style={styles.copy}>You’re not following anyone yet.</Text> : null}
       {field("display_name", "Display name")}{field("bio", "A little about you", false, true)}{field("interests", "Interests, separated by commas")}
-      <Pressable style={styles.checkLine} onPress={() => update("recommendations_consent", String(!(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent)))}><Text>{(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent) ? "☑" : "□"}  Allow recommendations</Text></Pressable>
-      <Pressable style={styles.checkLine} onPress={() => update("context_assistance_consent", String(!(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent)))}><Text>{(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent) ? "☑" : "□"}  Allow local context help</Text></Pressable>
+      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.recommendations_consent ? form.recommendations_consent === "true" : Boolean(me?.recommendations_consent) }} style={styles.checkLine} onPress={() => update("recommendations_consent", String(!(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent)))}><Text>{(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent) ? "☑" : "□"}  Local recommendations from real public posts. No generative AI service.</Text></Pressable>
+      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_assistance_consent ? form.context_assistance_consent === "true" : Boolean(me?.context_assistance_consent) }} style={styles.checkLine} onPress={() => update("context_assistance_consent", String(!(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent)))}><Text>{(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent) ? "☑" : "□"}  Local extractive context help. Each request needs confirmation; no answer is generated.</Text></Pressable>
       {button("Save profile", async () => { try { const result = await request("/api/profile", "PATCH", {
         display_name: form.display_name || me?.display_name, bio: form.bio ?? me?.bio,
         interests: (form.interests ?? me?.interests.join(",") ?? "").split(",").map(x => x.trim()).filter(Boolean),
@@ -405,12 +478,13 @@ export default function App() {
       }); setMe(result.user); Alert.alert("Saved", "Your profile and choices have been updated."); } catch (e) { fail(e); } })}
       {me?.recommendations_consent ? <>
         <Text style={styles.section}>Member suggestions</Text>
+        <Text style={styles.copy}>A local comparison of opted-in interests and real public posts, not a generative AI service.</Text>
         {button("Find members from real posts", async () => {
           try { setRecommendations((await request("/api/recommendations")).recommendations); }
           catch (e) { fail(e); }
         }, true)}
         {recommendations.map(person => <View key={person.id} style={styles.post}>
-          <Text style={styles.author}>{person.display_name} <Text style={styles.handle}>@{person.username}</Text></Text>
+          <View style={styles.postAuthor}><Avatar user={person} /><View><Text style={styles.author}>{person.display_name}</Text><Text style={styles.handle}>@{person.username}</Text></View></View>
           <Text style={styles.copy}>{person.bio || "A member sharing public posts."}</Text>
           {button("Follow", async () => { try { await request(`/api/users/${person.username}/follow`, "POST"); } catch (e) { fail(e); } })}
           {button("Message", () => startConversation(person.username), true)}
@@ -421,7 +495,7 @@ export default function App() {
       <Text style={styles.copy}>Your text is processed in memory only. Opt in above, then confirm each request.</Text>
       {field("context_text", "Paste text you want help with", false, true)}
       {field("context_question", "What would you like to find?", false)}
-      <Pressable style={styles.checkLine} onPress={() => update("context_confirm", form.context_confirm === "true" ? "false" : "true")}>
+      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_confirm === "true" }} style={styles.checkLine} onPress={() => update("context_confirm", form.context_confirm === "true" ? "false" : "true")}>
         <Text>{form.context_confirm === "true" ? "☑" : "□"}  Use this text locally for this request</Text>
       </Pressable>
       {button("Find relevant sentences", async () => {
@@ -451,14 +525,14 @@ export default function App() {
       <View style={styles.row}><Text style={styles.copy}>Visible to: </Text><Pressable onPress={() => update("visibility", form.visibility === "public" ? "followers" : form.visibility === "followers" ? "private" : "public")}><Text style={styles.link}>{form.visibility || "public"} ⌄</Text></Pressable></View>
       {button("Share thought", async () => { try { await request("/api/posts", "POST", { body: form.post, visibility: form.visibility || "public" }); update("post", ""); await loadFeed(); } catch (e) { fail(e); } })}
       {loading ? <ActivityIndicator color="#7864bc" style={{ margin: 20 }} /> : posts.map(post => postCard(post))}
-      {!loading && posts.length === 0 ? <View style={styles.empty}><Text style={styles.section}>Nothing here just yet.</Text><Text style={styles.copy}>Conversations shared by real Zorlii members will appear here.</Text></View> : null}
+      {!loading && posts.length === 0 ? <View style={styles.empty}><BrandHalo size={58} /><Text style={styles.section}>Nothing here just yet.</Text><Text style={styles.copy}>Conversations shared by real Zorlii members will appear here.</Text></View> : null}
     </View>;
   }
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
     <StatusBar style="dark" />
-    <View style={styles.header}><Image source={require("./assets/zorlii-logo.png")} style={styles.logo} resizeMode="contain" /><View><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub}>A thoughtful little corner</Text></View>
-      {me ? <Text style={styles.userTag}>@{me.username}</Text> : null}</View>
+    <View style={styles.header}><BrandHalo size={42} showLogo /><View style={styles.headerCopy}><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub} numberOfLines={1}>A thoughtful little corner</Text></View>
+      {me ? <View style={styles.userTag}><Avatar user={me} size={24} /><Text style={styles.userTagText} numberOfLines={1}>@{me.username}</Text></View> : null}</View>
     {me ? nav() : null}
     <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
       {error ? <Pressable onPress={() => setError("")} style={styles.error}><Text style={styles.errorText}>{error}  ×</Text></Pressable> : null}
@@ -469,30 +543,41 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#fbfaf8" },
-  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 20, paddingTop: Platform.OS === "ios" ? 57 : 28, paddingBottom: 14, backgroundColor: "#1b192e" },
-  logo: { width: 42, height: 42, borderRadius: 13, backgroundColor: "#29263d" },
-  brand: { color: "white", fontSize: 22, fontWeight: "700" }, headerSub: { color: "#c5c1d4", fontSize: 12 }, userTag: { color: "#e9e6f3", marginLeft: "auto" },
-  tabs: { flexDirection: "row", justifyContent: "space-around", backgroundColor: "#29263d", paddingVertical: 11 },
-  tab: { color: "#c5c1d4", fontSize: 13, fontWeight: "600", paddingHorizontal: 6 }, activeTab: { color: "white", textDecorationLine: "underline" },
+  screen: { flex: 1, backgroundColor: "#f8f6fb" },
+  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 20, paddingTop: Platform.OS === "ios" ? 57 : 28, paddingBottom: 14, backgroundColor: "#211b38", borderBottomWidth: 1, borderBottomColor: "#493d67" },
+  logo: { width: 42, height: 42, borderRadius: 14, backgroundColor: "#302849" },
+  brandHaloWrap: { alignItems: "center", justifyContent: "center", position: "relative", borderWidth: 1, borderColor: "#9b8ddd77", shadowColor: "#b9aaf5", shadowOpacity: 0.45, shadowRadius: 10, shadowOffset: { width: 0, height: 2 }, elevation: 3 },
+  brandHaloRing: { alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#b7a9ef", backgroundColor: "#3a3155" },
+  brandCore: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#302849" },
+  brandMonogram: { color: "#fbf8ff", fontFamily: "serif", fontWeight: "700" },
+  brandPulse: { position: "absolute", top: 3, right: 3, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: "#fff5ed", backgroundColor: "#f0b287", shadowColor: "#f0b287", shadowOpacity: 0.9, shadowRadius: 7, elevation: 4 },
+  brand: { color: "white", fontSize: 22, fontWeight: "700" }, headerCopy: { flexShrink: 1, minWidth: 0 }, headerSub: { color: "#c5c1d4", fontSize: 12 }, userTag: { flexDirection: "row", alignItems: "center", gap: 3, marginLeft: "auto", maxWidth: 86, flexShrink: 1 }, userTagText: { color: "#e9e6f3", fontSize: 11, minWidth: 0, flexShrink: 1 },
+  tabs: { flexDirection: "row", justifyContent: "space-around", backgroundColor: "#302849", paddingVertical: 12, borderBottomLeftRadius: 18, borderBottomRightRadius: 18 },
+  tab: { color: "#cbc5da", fontSize: 13, fontWeight: "600", paddingHorizontal: 6 }, activeTab: { color: "white", textDecorationLine: "underline" },
   content: { padding: 20, paddingBottom: 50, flexGrow: 1 }, form: { marginTop: 16 },
-  title: { color: "#1d1b32", fontSize: 30, fontWeight: "700", marginBottom: 8 },
-  eyebrow: { color: "#7864bc", fontSize: 11, letterSpacing: 1.8, textTransform: "uppercase" },
-  section: { fontSize: 18, fontWeight: "700", color: "#1d1b32", marginVertical: 10 },
-  copy: { color: "#77758b", lineHeight: 21, marginVertical: 5 }, handle: { color: "#77758b", fontSize: 13 },
-  input: { backgroundColor: "white", borderWidth: 1, borderColor: "#e7e4ee", paddingHorizontal: 13, paddingVertical: 12, borderRadius: 10, marginVertical: 6, color: "#1d1b32", minHeight: 46 },
+  title: { color: "#251d43", fontFamily: "serif", fontSize: 32, fontWeight: "400", marginBottom: 8 },
+  eyebrow: { color: "#6955bd", fontSize: 11, letterSpacing: 1.8, textTransform: "uppercase", fontWeight: "700" },
+  section: { fontSize: 19, fontFamily: "serif", fontWeight: "600", color: "#251d43", marginVertical: 10 },
+  copy: { color: "#6d6881", lineHeight: 21, marginVertical: 5 }, handle: { color: "#6d6881", fontSize: 13 },
+  input: { backgroundColor: "#fffefa", borderWidth: 1, borderColor: "#e5dfed", paddingHorizontal: 13, paddingVertical: 12, borderRadius: 12, marginVertical: 6, color: "#251d43", minHeight: 46 },
   multiline: { minHeight: 82, textAlignVertical: "top" },
-  button: { backgroundColor: "#7864bc", borderRadius: 10, paddingVertical: 12, paddingHorizontal: 14, marginVertical: 5, alignItems: "center", alignSelf: "flex-start", minWidth: 116 },
-  buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "transparent", borderWidth: 1, borderColor: "#e7e4ee" }, secondaryText: { color: "#6250a2" },
-  post: { borderBottomWidth: 1, borderBottomColor: "#e7e4ee", paddingVertical: 16 }, author: { color: "#1d1b32", fontWeight: "700" },
+  button: { backgroundColor: "#7160c8", borderRadius: 12, paddingVertical: 12, paddingHorizontal: 15, marginVertical: 5, alignItems: "center", alignSelf: "flex-start", minWidth: 116 },
+  buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "#fffefa", borderWidth: 1, borderColor: "#e5dfed" }, secondaryText: { color: "#5e4db2" },
+  post: { borderWidth: 1, borderColor: "#e9e3ef", borderRadius: 17, backgroundColor: "#fffefa", padding: 16, marginVertical: 7, shadowColor: "#30204c", shadowOpacity: 0.045, shadowRadius: 12, shadowOffset: { width: 0, height: 6 }, elevation: 1 }, author: { color: "#251d43", fontWeight: "700" },
+  postAuthor: { flexDirection: "row", alignItems: "center", gap: 11, marginBottom: 10 },
+  avatarHalo: { alignItems: "center", justifyContent: "center", position: "relative", backgroundColor: "#f1edff", borderWidth: 2, borderColor: "#cfc3f6", shadowColor: "#7867c7", shadowOpacity: 0.28, shadowRadius: 8, shadowOffset: { width: 0, height: 3 }, elevation: 3 },
+  avatar: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#e8e0ff", borderWidth: 2, borderColor: "#fffefa" },
+  avatarPulse: { position: "absolute", top: 2, right: 2, width: 8, height: 8, borderRadius: 4, borderWidth: 1, borderColor: "#fff5ed", backgroundColor: "#f0b287", shadowColor: "#f0b287", shadowOpacity: 0.85, shadowRadius: 6, elevation: 4 },
+  avatarImage: { width: "100%", height: "100%" }, avatarInitials: { color: "#514178", fontWeight: "700", fontSize: 16 },
+  profileHero: { flexDirection: "row", alignItems: "center", gap: 17, marginBottom: 12, paddingVertical: 8 },
   unreadNotification: { borderLeftWidth: 3, borderLeftColor: "#7864bc", paddingLeft: 12, backgroundColor: "#f3f0fa" },
-  relationshipRow: { borderBottomWidth: 1, borderBottomColor: "#e7e4ee", paddingVertical: 10 },
+  relationshipRow: { borderBottomWidth: 1, borderBottomColor: "#e7e1ef", paddingVertical: 10 },
   postBody: { color: "#302d43", fontSize: 15, lineHeight: 22, marginVertical: 12 },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, row: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 7, marginVertical: 5 },
   link: { color: "#6250a2", fontWeight: "600", padding: 8 },
-  empty: { borderWidth: 1, borderStyle: "dashed", borderColor: "#d5d0e0", borderRadius: 14, padding: 20, marginVertical: 20 },
-  error: { padding: 12, backgroundColor: "#f8e9ee", borderRadius: 10, marginBottom: 12 }, errorText: { color: "#8a2942" },
-  checkLine: { padding: 12, marginVertical: 4, backgroundColor: "white", borderRadius: 9, borderWidth: 1, borderColor: "#e7e4ee" },
-  messageList: { minHeight: 180, maxHeight: 420, backgroundColor: "white", padding: 12, borderRadius: 12, borderWidth: 1, borderColor: "#e7e4ee", marginVertical: 12 },
+  empty: { alignItems: "center", borderWidth: 1, borderStyle: "dashed", borderColor: "#d5cdec", borderRadius: 18, padding: 22, marginVertical: 20, backgroundColor: "#fffefa" },
+  error: { padding: 12, backgroundColor: "#f8e9ee", borderRadius: 12, marginBottom: 12 }, errorText: { color: "#8a2942" },
+  checkLine: { padding: 13, marginVertical: 5, backgroundColor: "#fffefa", borderRadius: 12, borderWidth: 1, borderColor: "#e5dfed" },
+  messageList: { minHeight: 180, maxHeight: 420, backgroundColor: "#fffefa", padding: 12, borderRadius: 16, borderWidth: 1, borderColor: "#e7e1ef", marginVertical: 12 },
   message: { padding: 11, backgroundColor: "#eee9f8", borderRadius: 12, marginVertical: 5 },
 });

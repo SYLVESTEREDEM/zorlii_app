@@ -42,6 +42,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                     display_name TEXT NOT NULL,
                     bio TEXT NOT NULL DEFAULT '',
+                    avatar_filename TEXT,
                     interests TEXT NOT NULL DEFAULT '[]',
                     recommendations_consent INTEGER NOT NULL DEFAULT 0,
                     context_assistance_consent INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +158,9 @@ class Database:
             if "username" not in columns:
                 connection.execute("ALTER TABLE users ADD COLUMN username TEXT")
             connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL")
+            profile_columns = {row["name"] for row in connection.execute("PRAGMA table_info(profiles)")}
+            if "avatar_filename" not in profile_columns:
+                connection.execute("ALTER TABLE profiles ADD COLUMN avatar_filename TEXT")
             connection.execute(
                 "UPDATE users SET username = 'member' || id WHERE username IS NULL"
             )
@@ -177,7 +181,7 @@ class Database:
     def profile_for(self, user_id):
         with self.locked_connection() as connection:
             row = connection.execute(
-                """SELECT u.id, u.email, u.username, u.created_at, p.display_name, p.bio, p.interests,
+                """SELECT u.id, u.email, u.username, u.created_at, p.display_name, p.bio, p.avatar_filename, p.interests,
                           p.recommendations_consent, p.context_assistance_consent,
                           p.onboarding_completed
                    FROM users u JOIN profiles p ON p.user_id = u.id WHERE u.id = ?""",
@@ -187,6 +191,11 @@ class Database:
             return None
         result = dict(row)
         result["interests"] = json.loads(result["interests"])
+        result["avatar_url"] = (
+            f"/api/avatars/{result['id']}?v={result['avatar_filename'][:8]}"
+            if result["avatar_filename"] else None
+        )
+        result.pop("avatar_filename", None)
         result["recommendations_consent"] = bool(result["recommendations_consent"])
         result["context_assistance_consent"] = bool(result["context_assistance_consent"])
         result["onboarding_completed"] = bool(result["onboarding_completed"])

@@ -1,9 +1,15 @@
+import base64
+import io
 import os
+import shutil
 import smtplib
 import sqlite3
 import time
 import unittest
 from unittest import mock
+from pathlib import Path
+
+from PIL import Image
 
 os.environ["ZORLII_DB_PATH"] = ":memory:"
 
@@ -34,6 +40,7 @@ class SMTPAuthFailingMailer:
 
 class AccountApiTests(unittest.TestCase):
     def setUp(self):
+        self.avatar_dir = Path(__file__).with_name(f".avatar-test-storage-{id(self)}")
         self.secret_patch = mock.patch.dict(os.environ, {
             "ZORLII_OTP_SECRET": "test-secret-" + "x" * 40,
             "ZORLII_SMTP_HOST": "smtp.example.test",
@@ -42,10 +49,17 @@ class AccountApiTests(unittest.TestCase):
         self.secret_patch.start()
         self.db = Database(":memory:")
         self.mailer = CapturingMailer()
-        self.client = TestClient(new_app(self.db, self.mailer))
+        self.client = TestClient(new_app(self.db, self.mailer, self.avatar_dir))
 
     def tearDown(self):
         self.secret_patch.stop()
+        shutil.rmtree(self.avatar_dir, ignore_errors=True)
+
+    @staticmethod
+    def image_bytes(image_format="PNG"):
+        output = io.BytesIO()
+        Image.new("RGB", (32, 24), color=(96, 84, 180)).save(output, format=image_format)
+        return output.getvalue()
 
     def register(self, email="jamie@example.test", username="jamie", display_name="Jamie"):
         response = self.client.post(
@@ -441,6 +455,118 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(result.json()["recommendations"][0]["username"], "bob")
         self.assertNotIn("sample", result.text.lower())
         self.assertEqual(self.client.post("/api/posts", headers=ha, json={"body": "   "}).status_code, 422)
+
+    def test_local_context_requires_saved_opt_in_and_per_request_confirmation(self):
+        member = self.register()
+        headers = self.auth(member["token"])
+        request = {
+            "text": "Basil needs steady water. Tomatoes prefer full sun.",
+            "question": "How should I water basil?",
+            "consent_for_this_request": True,
+        }
+        self.assertEqual(self.client.post("/api/context", headers=headers, json=request).status_code, 403)
+        consent = self.client.patch("/api/profile", headers=headers, json={
+            "context_assistance_consent": True,
+        })
+        self.assertTrue(consent.json()["user"]["context_assistance_consent"])
+        self.assertEqual(self.client.post(
+            "/api/context", headers=headers,
+            json={**request, "consent_for_this_request": False},
+        ).status_code, 403)
+        result = self.client.post("/api/context", headers=headers, json=request)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["method"], "local extractive selection")
+        self.assertFalse(result.json()["stored"])
+        self.assertEqual(result.json()["sentences"], ["Basil needs steady water."])
+
+    def test_profile_photo_upload_validation_ownership_display_replacement_and_removal(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        alice_headers = self.auth(alice["token"])
+        bob_headers = self.auth(bob["token"])
+        png = self.image_bytes()
+
+        self.client.cookies.clear()
+        self.assertEqual(self.client.put(
+            "/api/profile/avatar", content=png, headers={"Content-Type": "image/png"},
+        ).status_code, 401)
+        unsupported = self.client.put(
+            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/gif"}, content=b"gif",
+        )
+        self.assertEqual(unsupported.status_code, 415)
+        spoofed = self.client.put(
+            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/jpeg"}, content=png,
+        )
+        self.assertEqual(spoofed.status_code, 400)
+        corrupt = self.client.put(
+            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"}, content=b"not an image",
+        )
+        self.assertEqual(corrupt.status_code, 400)
+        oversized = self.client.put(
+            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"},
+            content=b"x" * (2 * 1024 * 1024 + 1),
+        )
+        self.assertEqual(oversized.status_code, 413)
+
+        uploaded = self.client.put(
+            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"}, content=png,
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        avatar_url = uploaded.json()["avatar_url"]
+        self.assertRegex(avatar_url, rf"/api/avatars/{alice['user']['id']}\?v=[a-f0-9]{{8}}")
+        stored = list(self.avatar_dir.glob("*.jpg"))
+        self.assertEqual(len(stored), 1)
+        self.assertRegex(stored[0].name, r"^[a-f0-9]{32}\.jpg$")
+        fetched = self.client.get(avatar_url)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(fetched.headers["content-type"], "image/jpeg")
+        with Image.open(io.BytesIO(fetched.content)) as decoded:
+            self.assertEqual(decoded.size, (32, 24))
+
+        profile = self.client.get("/api/me", headers=alice_headers).json()["user"]
+        public_profile = self.client.get("/api/users/jamie", headers=bob_headers).json()["user"]
+        self.assertEqual(profile["avatar_url"], avatar_url)
+        self.assertEqual(public_profile["avatar_url"], avatar_url)
+        self.client.post("/api/posts", headers=alice_headers, json={"body": "A real post"})
+        post = self.client.get("/api/feed", headers=bob_headers).json()["posts"][0]
+        self.assertEqual(post["author"]["avatar_url"], avatar_url)
+        self.assertEqual(self.client.get(f"/api/avatars/{bob['user']['id']}").status_code, 404)
+
+        replacement = self.client.put(
+            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/jpeg"},
+            content=self.image_bytes("JPEG"),
+        )
+        self.assertEqual(replacement.status_code, 200, replacement.text)
+        self.assertEqual(len(list(self.avatar_dir.glob("*.jpg"))), 1)
+        self.assertNotEqual(replacement.json()["avatar_url"], avatar_url)
+        self.assertEqual(self.client.delete("/api/profile/avatar", headers=bob_headers).status_code, 200)
+        self.assertIsNone(self.client.get("/api/me", headers=bob_headers).json()["user"]["avatar_url"])
+        self.assertEqual(
+            self.client.get("/api/me", headers=alice_headers).json()["user"]["avatar_url"],
+            replacement.json()["avatar_url"],
+        )
+        removed = self.client.delete("/api/profile/avatar", headers=alice_headers)
+        self.assertEqual(removed.status_code, 200)
+        self.assertIsNone(self.client.get("/api/me", headers=alice_headers).json()["user"]["avatar_url"])
+        self.assertEqual(self.client.get(f"/api/avatars/{alice['user']['id']}").status_code, 404)
+        self.assertEqual(list(self.avatar_dir.glob("*.jpg")), [])
+
+    def test_account_deletion_removes_profile_photo(self):
+        alice = self.register()
+        headers = self.auth(alice["token"])
+        image = self.image_bytes()
+        uploaded = self.client.put(
+            "/api/profile/avatar", headers=headers,
+            json={"content_type": "image/png", "image_base64": base64.b64encode(image).decode("ascii")},
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        path = next(self.avatar_dir.glob("*.jpg"))
+        response = self.client.request(
+            "DELETE", "/api/account", headers=headers,
+            json={"password": "Correct horse battery staple 4!"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(path.exists())
 
     def test_account_export_contains_user_data_but_never_credentials(self):
         alice = self.register()

@@ -1,4 +1,5 @@
 import json
+import base64
 import hmac
 import logging
 import os
@@ -7,6 +8,8 @@ import secrets
 import sqlite3
 import time
 import hashlib
+import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 
@@ -15,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .context_assistance import extractive_context
@@ -42,6 +46,14 @@ DB = Database()
 LOGGER = logging.getLogger("zorlii.recovery")
 OTP_GENERIC_MESSAGE = "If the details can be verified, a one-time code may be sent. This response does not confirm delivery."
 PASSWORD_POLICY_MESSAGE = "Password must be 4–128 characters and include an uppercase letter, a lowercase letter, a number, and a special character."
+AVATAR_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_MAX_DIMENSION = 4096
+AVATAR_MAX_PIXELS = 16_000_000
+AVATAR_TYPES = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+}
 
 
 class OTPConfigurationError(RuntimeError):
@@ -232,18 +244,30 @@ def set_session(response: Response, token: str):
 
 
 def public_user(row):
-    return {
+    result = {
         "id": row["id"],
         "username": row["username"],
         "display_name": row["display_name"],
         "bio": row["bio"],
         "created_at": row["created_at"],
     }
+    if "avatar_filename" in row.keys():
+        result["avatar_url"] = (
+            f"/api/avatars/{row['id']}?v={row['avatar_filename'][:8]}"
+            if row["avatar_filename"] else None
+        )
+    return result
 
 
-def new_app(database=None, mailer=None):
+def new_app(database=None, mailer=None, avatar_directory=None):
     db = database or DB
     db.connect()
+    if avatar_directory is not None:
+        avatar_dir = Path(avatar_directory)
+    elif str(db.path) == ":memory:":
+        avatar_dir = Path(__file__).with_name("data") / "avatars"
+    else:
+        avatar_dir = Path(db.path).expanduser().parent / "avatars"
     app = FastAPI(title="Zorlii API", version="1.0.0")
     app.add_middleware(
         CORSMiddleware,
@@ -281,6 +305,7 @@ def new_app(database=None, mailer=None):
     def visible_post(connection, post_id, viewer_id):
         row = connection.execute(
             """SELECT p.*, u.username, pr.display_name, pr.bio,
+                      pr.avatar_filename,
                       (SELECT COUNT(*) FROM replies r WHERE r.post_id=p.id) AS reply_count,
                       (SELECT COUNT(*) FROM reactions x WHERE x.post_id=p.id) AS reaction_count,
                       EXISTS(SELECT 1 FROM reactions x WHERE x.post_id=p.id AND x.user_id=?) AS reacted,
@@ -310,6 +335,10 @@ def new_app(database=None, mailer=None):
                 "username": row["username"],
                 "display_name": row["display_name"],
                 "bio": row["bio"],
+                "avatar_url": (
+                    f"/api/avatars/{row['user_id']}?v={row['avatar_filename'][:8]}"
+                    if row["avatar_filename"] else None
+                ),
             },
             "reply_count": row["reply_count"],
             "reaction_count": row["reaction_count"],
@@ -325,6 +354,133 @@ def new_app(database=None, mailer=None):
         except (EmailConfigurationError, ValueError):
             email = "not_configured"
         return {"status": "ok", "email": email}
+
+    @app.get("/api/avatars/{user_id}")
+    def get_avatar(user_id: int):
+        with db.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT avatar_filename FROM profiles WHERE user_id=?", (user_id,)
+            ).fetchone()
+        if row is None or not row["avatar_filename"]:
+            raise HTTPException(status_code=404, detail="Profile photo not found.")
+        filename = row["avatar_filename"]
+        if not re.fullmatch(r"[a-f0-9]{32}\.jpg", filename):
+            raise HTTPException(status_code=404, detail="Profile photo not found.")
+        path = avatar_dir / filename
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Profile photo not found.")
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    @app.put("/api/profile/avatar")
+    async def upload_avatar(request: Request, user: User):
+        request_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if request_type not in AVATAR_TYPES and request_type != "application/json":
+            raise HTTPException(status_code=415, detail="Choose a JPEG, PNG, or WebP image.")
+        request_limit = AVATAR_MAX_BYTES if request_type in AVATAR_TYPES else (AVATAR_MAX_BYTES * 4 // 3) + 4096
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > request_limit:
+                    raise HTTPException(status_code=413, detail="Profile photos must be 2 MB or smaller.")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid content length.")
+        chunks = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > request_limit:
+                raise HTTPException(status_code=413, detail="Profile photos must be 2 MB or smaller.")
+            chunks.append(chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="Choose a photo to upload.")
+
+        content = b"".join(chunks)
+        if request_type == "application/json":
+            try:
+                payload = json.loads(content)
+                content_type = payload["content_type"]
+                encoded = payload["image_base64"]
+                if content_type not in AVATAR_TYPES or not isinstance(encoded, str):
+                    raise ValueError
+                content = base64.b64decode(encoded, validate=True)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise HTTPException(status_code=400, detail="Choose a valid JPEG, PNG, or WebP image.")
+            if len(content) > AVATAR_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="Profile photos must be 2 MB or smaller.")
+        else:
+            content_type = request_type
+        try:
+            source = BytesIO(content)
+            with Image.open(source) as image:
+                if image.format != AVATAR_TYPES[content_type]:
+                    raise ValueError("Image format does not match its content type.")
+                if image.width > AVATAR_MAX_DIMENSION or image.height > AVATAR_MAX_DIMENSION:
+                    raise ValueError("Image dimensions are too large.")
+                if image.width * image.height > AVATAR_MAX_PIXELS:
+                    raise ValueError("Image dimensions are too large.")
+                image.verify()
+            source.seek(0)
+            with Image.open(source) as image:
+                image.load()
+                image = ImageOps.exif_transpose(image)
+                if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, "white")
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    image = background
+                else:
+                    image = image.convert("RGB")
+                output = BytesIO()
+                image.save(output, format="JPEG", quality=86, optimize=True)
+                image_bytes = output.getvalue()
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+            raise HTTPException(status_code=400, detail="Upload a valid JPEG, PNG, or WebP image.")
+
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4().hex}.jpg"
+        new_path = avatar_dir / filename
+        try:
+            new_path.write_bytes(image_bytes)
+            with db.transaction() as connection:
+                current = connection.execute(
+                    "SELECT avatar_filename FROM profiles WHERE user_id=?", (user["id"],)
+                ).fetchone()
+                if current is None:
+                    raise HTTPException(status_code=404, detail="Profile not found.")
+                old_filename = current["avatar_filename"]
+                connection.execute(
+                    "UPDATE profiles SET avatar_filename=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
+                    (filename, user["id"]),
+                )
+        except Exception:
+            new_path.unlink(missing_ok=True)
+            raise
+        if old_filename and old_filename != filename:
+            old_path = avatar_dir / old_filename
+            if re.fullmatch(r"[a-f0-9]{32}\.jpg", old_filename):
+                old_path.unlink(missing_ok=True)
+        return {"avatar_url": f"/api/avatars/{user['id']}?v={filename[:8]}"}
+
+    @app.delete("/api/profile/avatar")
+    def remove_avatar(user: User):
+        with db.transaction() as connection:
+            row = connection.execute(
+                "SELECT avatar_filename FROM profiles WHERE user_id=?", (user["id"],)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Profile not found.")
+            filename = row["avatar_filename"]
+            connection.execute(
+                "UPDATE profiles SET avatar_filename=NULL, updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
+                (user["id"],),
+            )
+        if filename and re.fullmatch(r"[a-f0-9]{32}\.jpg", filename):
+            (avatar_dir / filename).unlink(missing_ok=True)
+        return {"avatar_url": None}
 
     def issue_otp(purpose, email, request, registration=None):
         try:
@@ -738,7 +894,8 @@ def new_app(database=None, mailer=None):
     def delete_account(data: AccountDeleteInput, user: User, response: Response):
         with db.locked_connection() as connection:
             row = connection.execute(
-                "SELECT password_hash FROM users WHERE id=?",
+                """SELECT u.password_hash,p.avatar_filename FROM users u
+                   JOIN profiles p ON p.user_id=u.id WHERE u.id=?""",
                 (user["id"],),
             ).fetchone()
         if row is None or not verify_password(data.password, row["password_hash"]):
@@ -751,6 +908,8 @@ def new_app(database=None, mailer=None):
                        WHERE cp.conversation_id=conversations.id
                    )"""
             )
+        if row["avatar_filename"] and re.fullmatch(r"[a-f0-9]{32}\.jpg", row["avatar_filename"]):
+            (avatar_dir / row["avatar_filename"]).unlink(missing_ok=True)
         response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="strict")
         return {"message": "Your account and account-owned content have been permanently deleted."}
 
@@ -772,7 +931,7 @@ def new_app(database=None, mailer=None):
     def get_public_profile(username: str, user: User):
         with db.locked_connection() as connection:
             row = connection.execute(
-                """SELECT u.id,u.username,u.created_at,p.display_name,p.bio
+                """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
                    FROM users u JOIN profiles p ON p.user_id=u.id WHERE u.username=?""",
                 (username.lower().lstrip("@"),),
             ).fetchone()
@@ -826,7 +985,7 @@ def new_app(database=None, mailer=None):
                 (target["id"],),
             ).fetchone()[0]
             rows = connection.execute(
-                f"""SELECT u.id,u.username,u.created_at,p.display_name,p.bio
+                f"""SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
                     FROM follows f JOIN users u ON u.id=f.{source_column}
                     JOIN profiles p ON p.user_id=u.id
                     WHERE f.{target_column}=?
@@ -925,14 +1084,17 @@ def new_app(database=None, mailer=None):
             if row is None:
                 raise HTTPException(status_code=404, detail="Post not found.")
             replies = connection.execute(
-                """SELECT r.id,r.body,r.created_at,u.id AS user_id,u.username,p.display_name
+                """SELECT r.id,r.body,r.created_at,u.id AS user_id,u.username,p.display_name,p.avatar_filename
                    FROM replies r JOIN users u ON u.id=r.user_id JOIN profiles p ON p.user_id=u.id
                    WHERE r.post_id=? ORDER BY r.id LIMIT 100""",
                 (post_id,),
             ).fetchall()
         return {"post": post_payload(row), "replies": [
             {"id": r["id"], "body": r["body"], "created_at": r["created_at"],
-             "author": {"id": r["user_id"], "username": r["username"], "display_name": r["display_name"]}}
+             "author": {
+                 "id": r["user_id"], "username": r["username"], "display_name": r["display_name"],
+                 "avatar_url": f"/api/avatars/{r['user_id']}" if r["avatar_filename"] else None,
+             }}
             for r in replies
         ]}
 
@@ -1015,7 +1177,7 @@ def new_app(database=None, mailer=None):
         term = f"%{q.strip()}%"
         with db.locked_connection() as connection:
             people = connection.execute(
-                """SELECT u.id,u.username,u.created_at,p.display_name,p.bio FROM users u
+                """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename FROM users u
                    JOIN profiles p ON p.user_id=u.id WHERE u.username LIKE ? OR p.display_name LIKE ?
                    ORDER BY u.username LIMIT 30""",
                 (term, term),
@@ -1049,13 +1211,20 @@ def new_app(database=None, mailer=None):
             result = []
             for row in rows:
                 participants = connection.execute(
-                    """SELECT u.id,u.username,p.display_name FROM conversation_participants cp
+                    """SELECT u.id,u.username,p.display_name,p.avatar_filename FROM conversation_participants cp
                        JOIN users u ON u.id=cp.user_id JOIN profiles p ON p.user_id=u.id
                        WHERE cp.conversation_id=? AND cp.user_id<>?""",
                     (row["id"], user["id"]),
                 ).fetchall()
                 result.append({"id": row["id"], "last_message": row["last_message"],
-                               "last_message_at": row["last_message_at"], "participants": [dict(p) for p in participants]})
+                               "last_message_at": row["last_message_at"], "participants": [
+                                   {
+                                       "id": p["id"], "username": p["username"], "display_name": p["display_name"],
+                                       "avatar_url": f"/api/avatars/{p['id']}?v={p['avatar_filename'][:8]}"
+                                       if p["avatar_filename"] else None,
+                                   }
+                                   for p in participants
+                               ]})
         return {"conversations": result}
 
     @app.post("/api/conversations", status_code=201)
@@ -1095,14 +1264,18 @@ def new_app(database=None, mailer=None):
         with db.locked_connection() as connection:
             require_conversation_participant(connection, conversation_id, user["id"])
             rows = connection.execute(
-                """SELECT m.id,m.body,m.created_at,m.sender_id,u.username,p.display_name
+                """SELECT m.id,m.body,m.created_at,m.sender_id,u.username,p.display_name,p.avatar_filename
                    FROM messages m JOIN users u ON u.id=m.sender_id JOIN profiles p ON p.user_id=u.id
                    WHERE m.conversation_id=? ORDER BY m.id DESC LIMIT ?""",
                 (conversation_id, limit),
             ).fetchall()
         return {"messages": [
             {"id": r["id"], "body": r["body"], "created_at": r["created_at"], "sender_id": r["sender_id"],
-             "author": {"username": r["username"], "display_name": r["display_name"]}}
+             "author": {
+                 "username": r["username"], "display_name": r["display_name"],
+                 "avatar_url": f"/api/avatars/{r['sender_id']}?v={r['avatar_filename'][:8]}"
+                 if r["avatar_filename"] else None,
+             }}
             for r in reversed(rows)
         ]}
 
@@ -1148,15 +1321,19 @@ def new_app(database=None, mailer=None):
                 (user["id"],),
             ).fetchone()[0]
             rows = connection.execute(
-                """SELECT n.id,n.kind,n.post_id,n.created_at,n.read_at,
-                          u.username,p.display_name
+                """SELECT n.id,n.actor_id,n.kind,n.post_id,n.created_at,n.read_at,
+                          u.username,p.display_name,p.avatar_filename
                    FROM notifications n JOIN users u ON u.id=n.actor_id JOIN profiles p ON p.user_id=u.id
                    WHERE n.user_id=? ORDER BY n.id DESC LIMIT 100""",
                 (user["id"],),
             ).fetchall()
         return {"notifications": [
             {"id": r["id"], "kind": r["kind"], "post_id": r["post_id"], "created_at": r["created_at"],
-             "read": bool(r["read_at"]), "actor": {"username": r["username"], "display_name": r["display_name"]}}
+             "read": bool(r["read_at"]), "actor": {
+                 "username": r["username"], "display_name": r["display_name"],
+                 "avatar_url": f"/api/avatars/{r['actor_id']}?v={r['avatar_filename'][:8]}"
+                 if r["avatar_filename"] else None,
+             }}
             for r in rows
         ], "unread_count": unread_count}
 
@@ -1196,7 +1373,7 @@ def new_app(database=None, mailer=None):
             placeholders = ",".join("?" for _ in following_ids) or "-1"
             params = [user["id"], *following_ids]
             rows = connection.execute(
-                f"""SELECT u.id,u.username,u.created_at,p.display_name,p.bio,
+                f"""SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename,
                            GROUP_CONCAT(posts.body, ' ') AS text
                     FROM users u JOIN profiles p ON p.user_id=u.id
                     JOIN posts ON posts.user_id=u.id AND posts.visibility='public'
