@@ -116,6 +116,16 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("styles.avatarHalo", mobile)
         self.assertIn("styles.avatarPulse", mobile)
 
+    def test_create_navigation_targets_the_existing_composer_on_both_clients(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn('data-action="create-post"', html)
+        self.assertIn("document.getElementById('post-body')?.focus()", html)
+        self.assertIn('["feed", "explore", "create", "inbox", "notifications", "profile"]', mobile)
+        self.assertIn("composerRef.current?.focus()", mobile)
+        self.assertIn("Privacy &amp; local tools", html)
+        self.assertIn("Privacy & local tools", mobile)
+
 
 if __name__ == "__main__":
     unittest.main()

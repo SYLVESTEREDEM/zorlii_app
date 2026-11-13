@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable,
   ScrollView, Share, StyleSheet, Text, TextInput, View,
@@ -54,6 +54,7 @@ function Avatar({ user, size = 42 }: { user?: { display_name?: string; username?
 }
 
 export default function App() {
+  const composerRef = useRef<React.ElementRef<typeof TextInput> | null>(null);
   const [token, setToken] = useState("");
   const [me, setMe] = useState<User | null>(null);
   const [screen, setScreen] = useState("login");
@@ -292,7 +293,7 @@ export default function App() {
     const profileValue = name === "display_name" ? me?.display_name
       : name === "bio" ? me?.bio : name === "interests" ? me?.interests.join(", ") : undefined;
     return (
-    <TextInput accessibilityLabel={placeholder} placeholder={placeholder} placeholderTextColor="#87849a"
+    <TextInput accessibilityLabel={placeholder} placeholder={placeholder} placeholderTextColor="#8987a5"
       value={form[name] ?? profileValue ?? ""} onChangeText={value => update(name, value)} secureTextEntry={secure}
       multiline={multiline} keyboardType={name === "code" ? "number-pad" : "default"}
       maxLength={name === "code" ? 6 : name === "password" && (screen === "register" || screen === "reset-code") ? 128 : undefined}
@@ -304,14 +305,38 @@ export default function App() {
       <Text style={[styles.buttonText, secondary && styles.secondaryText]}>{label}</Text>
     </Pressable>
   );
-  const nav = () => <View style={styles.tabs}>
-    {["feed", "explore", "inbox", "notifications", "profile"].map(item => <Pressable key={item} onPress={() => {
-      if (item === "feed") { setScreen("feed"); loadFeed(); }
-      if (item === "explore") setScreen("explore");
-      if (item === "inbox") loadInbox();
-      if (item === "notifications") { setScreen("notifications"); loadNotifications(); }
-      if (item === "profile") loadProfile();
-    }}><Text style={[styles.tab, screen.startsWith(item) && styles.activeTab]}>{item === "feed" ? "Pulse" : item === "notifications" ? `Notifications${unreadNotifications ? ` · ${unreadNotifications}` : ""}` : item[0].toUpperCase() + item.slice(1)}</Text></Pressable>)}
+  const navItems = ["feed", "explore", "create", "inbox", "notifications", "profile"];
+  const navLabels: Record<string, string> = {
+    feed: "Pulse", explore: "Explore", create: "Create", inbox: "Inbox",
+    notifications: "Alerts", profile: "You",
+  };
+  const navIcons: Record<string, string> = {
+    feed: "⌂", explore: "⌕", create: "+", inbox: "✉", notifications: "◔", profile: "♙",
+  };
+  const nav = () => <View style={styles.tabs} accessibilityLabel="Main navigation">
+    {navItems.map(item => {
+      const selected = screen.startsWith(item);
+      const label = item === "notifications" && unreadNotifications
+        ? `${navLabels[item]}, ${unreadNotifications} unread`
+        : item === "create" ? "Create a post" : navLabels[item];
+      return <Pressable key={item} accessibilityRole="button" accessibilityLabel={label}
+        accessibilityState={{ selected }} style={[styles.tabItem, item === "create" && styles.createTab]}
+        onPress={() => {
+          if (item === "feed") { setScreen("feed"); loadFeed(); }
+          if (item === "explore") setScreen("explore");
+          if (item === "create") {
+            if (screen !== "feed") { setScreen("feed"); loadFeed(); }
+            requestAnimationFrame(() => composerRef.current?.focus());
+          }
+          if (item === "inbox") loadInbox();
+          if (item === "notifications") { setScreen("notifications"); loadNotifications(); }
+          if (item === "profile") loadProfile();
+        }}>
+        <Text style={[styles.tabIcon, selected && styles.activeTabIcon, item === "create" && styles.createIcon]}
+          accessibilityElementsHidden>{navIcons[item]}{item === "notifications" && unreadNotifications > 0 ? <Text style={styles.tabBadge}>{unreadNotifications}</Text> : null}</Text>
+        <Text style={[styles.tab, selected && styles.activeTab]}>{navLabels[item]}</Text>
+      </Pressable>;
+    })}
   </View>;
   const postCard = (post: Post) => <View key={post.id} style={styles.post}>
     <View style={styles.postAuthor}><Avatar user={post.author} /><View><Text style={styles.author}>{post.author.display_name}</Text><Text style={styles.handle}>@{post.author.username}</Text></View></View>
@@ -410,7 +435,7 @@ export default function App() {
         {button("Refresh", loadNotifications, true)}
         {unreadNotifications ? button("Mark all as read", markAllNotificationsRead, true) : null}
       </View>
-      {loading ? <ActivityIndicator color="#7864bc" style={{ margin: 20 }} /> : null}
+      {loading ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} /> : null}
       {notifications.map(item => <View key={item.id} style={[styles.post, !item.read && styles.unreadNotification]}>
         <View style={styles.postAuthor}><Avatar user={item.actor} size={38} /><View><Text style={styles.author}>{item.actor.display_name}</Text><Text style={styles.handle}>@{item.actor.username}</Text></View></View>
         <Text style={styles.copy}>{item.kind === "follow" ? "started following you." : item.kind === "reply" ? "replied to your post." : "reacted to your post."}</Text>
@@ -468,6 +493,8 @@ export default function App() {
       </View>)}
       {!following.length ? <Text style={styles.copy}>You’re not following anyone yet.</Text> : null}
       {field("display_name", "Display name")}{field("bio", "A little about you", false, true)}{field("interests", "Interests, separated by commas")}
+      <Text style={styles.section}>Privacy & local tools</Text>
+      <Text style={styles.copy}>Both features stay off until you opt in. Recommendations compare real public posts; context help selects supplied sentences. No generative AI is used.</Text>
       <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.recommendations_consent ? form.recommendations_consent === "true" : Boolean(me?.recommendations_consent) }} style={styles.checkLine} onPress={() => update("recommendations_consent", String(!(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent)))}><Text>{(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent) ? "☑" : "□"}  Local recommendations from real public posts. No generative AI service.</Text></Pressable>
       <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_assistance_consent ? form.context_assistance_consent === "true" : Boolean(me?.context_assistance_consent) }} style={styles.checkLine} onPress={() => update("context_assistance_consent", String(!(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent)))}><Text>{(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent) ? "☑" : "□"}  Local extractive context help. Each request needs confirmation; no answer is generated.</Text></Pressable>
       {button("Save profile", async () => { try { const result = await request("/api/profile", "PATCH", {
@@ -521,63 +548,69 @@ export default function App() {
     return <View>
       <Text style={styles.eyebrow}>Your community, in focus</Text><Text style={styles.title}>Pulse</Text>
       <View style={styles.row}>{button("Everyone", () => loadFeed("all"), true)}{button("Following", () => loadFeed("following"), true)}{button("Saved", () => loadFeed("bookmarks"), true)}</View>
-      <TextInput accessibilityLabel="Write a post" placeholder="What would you like to share?" multiline maxLength={5000} value={form.post || ""} onChangeText={value => update("post", value)} style={[styles.input, styles.multiline]} />
+      <TextInput ref={composerRef} accessibilityLabel="Write a post" placeholder="What would you like to share?" multiline maxLength={5000} value={form.post || ""} onChangeText={value => update("post", value)} style={[styles.input, styles.multiline]} />
       <View style={styles.row}><Text style={styles.copy}>Visible to: </Text><Pressable onPress={() => update("visibility", form.visibility === "public" ? "followers" : form.visibility === "followers" ? "private" : "public")}><Text style={styles.link}>{form.visibility || "public"} ⌄</Text></Pressable></View>
       {button("Share thought", async () => { try { await request("/api/posts", "POST", { body: form.post, visibility: form.visibility || "public" }); update("post", ""); await loadFeed(); } catch (e) { fail(e); } })}
-      {loading ? <ActivityIndicator color="#7864bc" style={{ margin: 20 }} /> : posts.map(post => postCard(post))}
+      {loading ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} /> : posts.map(post => postCard(post))}
       {!loading && posts.length === 0 ? <View style={styles.empty}><BrandHalo size={58} /><Text style={styles.section}>Nothing here just yet.</Text><Text style={styles.copy}>Conversations shared by real Zorlii members will appear here.</Text></View> : null}
     </View>;
   }
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-    <StatusBar style="dark" />
+    <StatusBar style="light" />
     <View style={styles.header}><BrandHalo size={42} showLogo /><View style={styles.headerCopy}><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub} numberOfLines={1}>A thoughtful little corner</Text></View>
       {me ? <View style={styles.userTag}><Avatar user={me} size={24} /><Text style={styles.userTagText} numberOfLines={1}>@{me.username}</Text></View> : null}</View>
-    {me ? nav() : null}
     <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
       {error ? <Pressable onPress={() => setError("")} style={styles.error}><Text style={styles.errorText}>{error}  ×</Text></Pressable> : null}
-      {loading && screen !== "feed" ? <ActivityIndicator color="#7864bc" /> : null}
+      {loading && screen !== "feed" ? <ActivityIndicator color="#a47dff" /> : null}
       {renderBody()}
     </ScrollView>
+    {me ? nav() : null}
   </KeyboardAvoidingView>;
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#f8f6fb" },
-  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 20, paddingTop: Platform.OS === "ios" ? 57 : 28, paddingBottom: 14, backgroundColor: "#211b38", borderBottomWidth: 1, borderBottomColor: "#493d67" },
-  logo: { width: 42, height: 42, borderRadius: 14, backgroundColor: "#302849" },
-  brandHaloWrap: { alignItems: "center", justifyContent: "center", position: "relative", borderWidth: 1, borderColor: "#9b8ddd77", shadowColor: "#b9aaf5", shadowOpacity: 0.45, shadowRadius: 10, shadowOffset: { width: 0, height: 2 }, elevation: 3 },
-  brandHaloRing: { alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#b7a9ef", backgroundColor: "#3a3155" },
-  brandCore: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#302849" },
+  screen: { flex: 1, backgroundColor: "#080a16" },
+  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 18, paddingTop: Platform.OS === "ios" ? 57 : 28, paddingBottom: 13, backgroundColor: "#0c1022", borderBottomWidth: 1, borderBottomColor: "#393054" },
+  logo: { width: 42, height: 42, borderRadius: 14, backgroundColor: "#15152d" },
+  brandHaloWrap: { alignItems: "center", justifyContent: "center", position: "relative", borderWidth: 1, borderColor: "#9674f7aa", shadowColor: "#9364ff", shadowOpacity: 0.5, shadowRadius: 12, shadowOffset: { width: 0, height: 2 }, elevation: 3 },
+  brandHaloRing: { alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#b69aff", backgroundColor: "#30205a" },
+  brandCore: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#17162e" },
   brandMonogram: { color: "#fbf8ff", fontFamily: "serif", fontWeight: "700" },
-  brandPulse: { position: "absolute", top: 3, right: 3, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: "#fff5ed", backgroundColor: "#f0b287", shadowColor: "#f0b287", shadowOpacity: 0.9, shadowRadius: 7, elevation: 4 },
-  brand: { color: "white", fontSize: 22, fontWeight: "700" }, headerCopy: { flexShrink: 1, minWidth: 0 }, headerSub: { color: "#c5c1d4", fontSize: 12 }, userTag: { flexDirection: "row", alignItems: "center", gap: 3, marginLeft: "auto", maxWidth: 86, flexShrink: 1 }, userTagText: { color: "#e9e6f3", fontSize: 11, minWidth: 0, flexShrink: 1 },
-  tabs: { flexDirection: "row", justifyContent: "space-around", backgroundColor: "#302849", paddingVertical: 12, borderBottomLeftRadius: 18, borderBottomRightRadius: 18 },
-  tab: { color: "#cbc5da", fontSize: 13, fontWeight: "600", paddingHorizontal: 6 }, activeTab: { color: "white", textDecorationLine: "underline" },
-  content: { padding: 20, paddingBottom: 50, flexGrow: 1 }, form: { marginTop: 16 },
-  title: { color: "#251d43", fontFamily: "serif", fontSize: 32, fontWeight: "400", marginBottom: 8 },
-  eyebrow: { color: "#6955bd", fontSize: 11, letterSpacing: 1.8, textTransform: "uppercase", fontWeight: "700" },
-  section: { fontSize: 19, fontFamily: "serif", fontWeight: "600", color: "#251d43", marginVertical: 10 },
-  copy: { color: "#6d6881", lineHeight: 21, marginVertical: 5 }, handle: { color: "#6d6881", fontSize: 13 },
-  input: { backgroundColor: "#fffefa", borderWidth: 1, borderColor: "#e5dfed", paddingHorizontal: 13, paddingVertical: 12, borderRadius: 12, marginVertical: 6, color: "#251d43", minHeight: 46 },
+  brandPulse: { position: "absolute", top: 3, right: 3, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: "#d8f6ff", backgroundColor: "#78d8ff", shadowColor: "#65caff", shadowOpacity: 0.9, shadowRadius: 7, elevation: 4 },
+  brand: { color: "#fff", fontSize: 20, fontWeight: "800", letterSpacing: 2.4, textTransform: "uppercase" }, headerCopy: { flexShrink: 1, minWidth: 0 }, headerSub: { color: "#aaa8c5", fontSize: 12 }, userTag: { flexDirection: "row", alignItems: "center", gap: 3, marginLeft: "auto", maxWidth: 86, flexShrink: 1 }, userTagText: { color: "#e9e6f3", fontSize: 11, minWidth: 0, flexShrink: 1 },
+  tabs: { flexDirection: "row", alignItems: "center", justifyContent: "space-around", backgroundColor: "#0d1021", paddingTop: 7, paddingBottom: Platform.OS === "ios" ? 24 : 8, paddingHorizontal: 4, borderTopWidth: 1, borderTopColor: "#55417b" },
+  tabItem: { width: "16.66%", minHeight: 53, alignItems: "center", justifyContent: "center", borderRadius: 11, paddingVertical: 3, position: "relative" },
+  createTab: { alignSelf: "center" },
+  tabIcon: { color: "#a9a4c5", fontSize: 19, lineHeight: 24, textAlign: "center", position: "relative", minWidth: 28, height: 28 },
+  activeTabIcon: { color: "#c8a9ff", textShadowColor: "#9a68ff", textShadowRadius: 9 },
+  createIcon: { color: "#fff", backgroundColor: "#7548f0", overflow: "hidden", borderRadius: 18, width: 36, height: 36, lineHeight: 35, fontSize: 27, shadowColor: "#875aff", shadowOpacity: 0.65, shadowRadius: 13, shadowOffset: { width: 0, height: 0 }, elevation: 6 },
+  tabBadge: { position: "absolute", top: -1, right: -9, minWidth: 15, height: 15, borderRadius: 8, overflow: "hidden", backgroundColor: "#7b4af1", color: "#fff", fontSize: 9, lineHeight: 15, textAlign: "center", fontWeight: "700" },
+  tab: { color: "#9e9bb8", fontSize: 10, fontWeight: "600", textAlign: "center" }, activeTab: { color: "#f5f0ff" },
+  content: { paddingHorizontal: 18, paddingTop: 23, paddingBottom: 24, flexGrow: 1 }, form: { marginTop: 16 },
+  title: { color: "#f4f1ff", fontFamily: "sans-serif", fontSize: 30, fontWeight: "700", letterSpacing: -0.5, marginBottom: 8 },
+  eyebrow: { color: "#b79bff", fontSize: 11, letterSpacing: 1.8, textTransform: "uppercase", fontWeight: "700" },
+  section: { fontSize: 19, fontFamily: "sans-serif", fontWeight: "700", color: "#eeeaff", marginVertical: 10 },
+  copy: { color: "#b2afca", lineHeight: 21, marginVertical: 5 }, handle: { color: "#a5a1c0", fontSize: 13 },
+  input: { backgroundColor: "#0d1021", borderWidth: 1, borderColor: "#393653", paddingHorizontal: 13, paddingVertical: 12, borderRadius: 12, marginVertical: 6, color: "#f4f1ff", minHeight: 46 },
   multiline: { minHeight: 82, textAlignVertical: "top" },
-  button: { backgroundColor: "#7160c8", borderRadius: 12, paddingVertical: 12, paddingHorizontal: 15, marginVertical: 5, alignItems: "center", alignSelf: "flex-start", minWidth: 116 },
-  buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "#fffefa", borderWidth: 1, borderColor: "#e5dfed" }, secondaryText: { color: "#5e4db2" },
-  post: { borderWidth: 1, borderColor: "#e9e3ef", borderRadius: 17, backgroundColor: "#fffefa", padding: 16, marginVertical: 7, shadowColor: "#30204c", shadowOpacity: 0.045, shadowRadius: 12, shadowOffset: { width: 0, height: 6 }, elevation: 1 }, author: { color: "#251d43", fontWeight: "700" },
+  button: { backgroundColor: "#7046e9", borderRadius: 11, paddingVertical: 12, paddingHorizontal: 15, marginVertical: 5, alignItems: "center", alignSelf: "flex-start", minWidth: 116, minHeight: 44, justifyContent: "center", shadowColor: "#7249ed", shadowOpacity: 0.18, shadowRadius: 10, shadowOffset: { width: 0, height: 3 }, elevation: 2 },
+  buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "#14162c", borderWidth: 1, borderColor: "#3a3554", shadowOpacity: 0 }, secondaryText: { color: "#cdbaff" },
+  post: { borderWidth: 1, borderColor: "#302d4d", borderRadius: 17, backgroundColor: "#11142a", padding: 16, marginVertical: 7, shadowColor: "#000", shadowOpacity: 0.22, shadowRadius: 14, shadowOffset: { width: 0, height: 7 }, elevation: 2 }, author: { color: "#f3f0ff", fontWeight: "700" },
   postAuthor: { flexDirection: "row", alignItems: "center", gap: 11, marginBottom: 10 },
-  avatarHalo: { alignItems: "center", justifyContent: "center", position: "relative", backgroundColor: "#f1edff", borderWidth: 2, borderColor: "#cfc3f6", shadowColor: "#7867c7", shadowOpacity: 0.28, shadowRadius: 8, shadowOffset: { width: 0, height: 3 }, elevation: 3 },
-  avatar: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#e8e0ff", borderWidth: 2, borderColor: "#fffefa" },
-  avatarPulse: { position: "absolute", top: 2, right: 2, width: 8, height: 8, borderRadius: 4, borderWidth: 1, borderColor: "#fff5ed", backgroundColor: "#f0b287", shadowColor: "#f0b287", shadowOpacity: 0.85, shadowRadius: 6, elevation: 4 },
-  avatarImage: { width: "100%", height: "100%" }, avatarInitials: { color: "#514178", fontWeight: "700", fontSize: 16 },
+  avatarHalo: { alignItems: "center", justifyContent: "center", position: "relative", backgroundColor: "#17152d", borderWidth: 2, borderColor: "#a27cff", shadowColor: "#9868ff", shadowOpacity: 0.48, shadowRadius: 10, shadowOffset: { width: 0, height: 3 }, elevation: 3 },
+  avatar: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#21183d", borderWidth: 2, borderColor: "#101225" },
+  avatarPulse: { position: "absolute", top: 2, right: 2, width: 8, height: 8, borderRadius: 4, borderWidth: 1, borderColor: "#e5f8ff", backgroundColor: "#74d7ff", shadowColor: "#68d6ff", shadowOpacity: 0.9, shadowRadius: 7, elevation: 4 },
+  avatarImage: { width: "100%", height: "100%" }, avatarInitials: { color: "#e6d9ff", fontWeight: "700", fontSize: 16 },
   profileHero: { flexDirection: "row", alignItems: "center", gap: 17, marginBottom: 12, paddingVertical: 8 },
-  unreadNotification: { borderLeftWidth: 3, borderLeftColor: "#7864bc", paddingLeft: 12, backgroundColor: "#f3f0fa" },
-  relationshipRow: { borderBottomWidth: 1, borderBottomColor: "#e7e1ef", paddingVertical: 10 },
-  postBody: { color: "#302d43", fontSize: 15, lineHeight: 22, marginVertical: 12 },
+  unreadNotification: { borderLeftWidth: 3, borderLeftColor: "#9b75ff", paddingLeft: 12, backgroundColor: "#191432" },
+  relationshipRow: { borderBottomWidth: 1, borderBottomColor: "#2b2947", paddingVertical: 10 },
+  postBody: { color: "#e8e5f7", fontSize: 15, lineHeight: 22, marginVertical: 12 },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, row: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 7, marginVertical: 5 },
-  link: { color: "#6250a2", fontWeight: "600", padding: 8 },
-  empty: { alignItems: "center", borderWidth: 1, borderStyle: "dashed", borderColor: "#d5cdec", borderRadius: 18, padding: 22, marginVertical: 20, backgroundColor: "#fffefa" },
-  error: { padding: 12, backgroundColor: "#f8e9ee", borderRadius: 12, marginBottom: 12 }, errorText: { color: "#8a2942" },
-  checkLine: { padding: 13, marginVertical: 5, backgroundColor: "#fffefa", borderRadius: 12, borderWidth: 1, borderColor: "#e5dfed" },
-  messageList: { minHeight: 180, maxHeight: 420, backgroundColor: "#fffefa", padding: 12, borderRadius: 16, borderWidth: 1, borderColor: "#e7e1ef", marginVertical: 12 },
-  message: { padding: 11, backgroundColor: "#eee9f8", borderRadius: 12, marginVertical: 5 },
+  link: { color: "#c2a8ff", fontWeight: "700", padding: 8 },
+  empty: { alignItems: "center", borderWidth: 1, borderStyle: "solid", borderColor: "#48386d", borderRadius: 18, padding: 24, marginVertical: 20, backgroundColor: "#11142a", shadowColor: "#784ce9", shadowOpacity: 0.14, shadowRadius: 24, shadowOffset: { width: 0, height: 0 }, elevation: 2 },
+  error: { padding: 12, backgroundColor: "#321b2c", borderColor: "#70405c", borderWidth: 1, borderRadius: 12, marginBottom: 12 }, errorText: { color: "#ffc4d4" },
+  checkLine: { padding: 13, marginVertical: 5, backgroundColor: "#11142a", borderRadius: 12, borderWidth: 1, borderColor: "#393653" },
+  messageList: { minHeight: 180, maxHeight: 420, backgroundColor: "#0c0f20", padding: 12, borderRadius: 16, borderWidth: 1, borderColor: "#302d4d", marginVertical: 12 },
+  message: { padding: 11, backgroundColor: "#1d1935", borderRadius: 12, marginVertical: 5 },
 });
