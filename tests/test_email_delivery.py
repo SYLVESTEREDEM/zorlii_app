@@ -1,9 +1,11 @@
+import io
 import json
 import os
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 
-from zorlii_app.email_delivery import ResendMailer, SMTPMailer, mailer_from_env
+from zorlii_app.email_delivery import ResendAPIError, ResendMailer, SMTPMailer, mailer_from_env
 
 
 class SMTPMailerTests(unittest.TestCase):
@@ -68,6 +70,21 @@ class ResendMailerTests(unittest.TestCase):
         self.assertIn("031947", payload["text"])
         self.assertNotIn("http", payload["text"].lower())
         urlopen.assert_called_once_with(request, timeout=15)
+
+    def test_reports_only_a_safe_resend_error_category(self):
+        body = json.dumps({
+            "name": "validation_error",
+            "message": "The auth.example.test domain is not verified.",
+        }).encode("utf-8")
+        error = HTTPError("https://api.resend.com/emails", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch("zorlii_app.email_delivery.urlopen", side_effect=error):
+            with self.assertRaises(ResendAPIError) as raised:
+                ResendMailer("re_test_key", "Zorlii <no-reply@auth.example.test>").send_otp(
+                    "member@example.test", "031947", "register"
+                )
+        self.assertEqual(raised.exception.code, 403)
+        self.assertEqual(raised.exception.provider_reason, "sender_domain_unverified")
+        self.assertNotIn("auth.example.test", str(raised.exception))
 
 
 if __name__ == "__main__":

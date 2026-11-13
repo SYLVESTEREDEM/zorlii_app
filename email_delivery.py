@@ -2,6 +2,7 @@ import json
 import os
 import smtplib
 from email.message import EmailMessage
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
@@ -11,6 +12,43 @@ class EmailConfigurationError(RuntimeError):
 
 class SMTPConfigurationError(EmailConfigurationError):
     pass
+
+
+class ResendAPIError(RuntimeError):
+    def __init__(self, status_code, reason):
+        super().__init__("Resend rejected the email request.")
+        self.code = status_code
+        self.provider_reason = reason
+
+
+def _resend_error_reason(error):
+    try:
+        body = json.loads(error.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "unavailable"
+    if not isinstance(body, dict):
+        return "unavailable"
+
+    name = body.get("name")
+    message = body.get("message")
+    message = message.lower() if isinstance(message, str) else ""
+    if "only send testing emails" in message or "testing emails to your own email" in message:
+        return "recipient_restricted"
+    if "domain" in message and "not verified" in message:
+        return "sender_domain_unverified"
+    if "api key" in message and ("invalid" in message or "missing" in message):
+        return "api_key_rejected"
+    if "permission" in message or name == "invalid_permission":
+        return "api_key_permission"
+    if name == "restricted_api_key":
+        return "api_key_restricted"
+    if name == "suspended_api_key":
+        return "api_key_suspended"
+    if "inboxes included" in message or "quota" in message:
+        return "quota_exceeded"
+    if name == "validation_error":
+        return "validation_error"
+    return "unavailable"
 
 
 def otp_email_content(code, purpose):
@@ -105,8 +143,11 @@ class ResendMailer:
             },
             method="POST",
         )
-        with urlopen(request, timeout=15):
-            pass
+        try:
+            with urlopen(request, timeout=15):
+                pass
+        except HTTPError as error:
+            raise ResendAPIError(error.code, _resend_error_reason(error)) from None
 
 
 def mailer_from_env():

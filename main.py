@@ -422,10 +422,24 @@ def new_app(database=None, mailer=None):
                 provider_code = getattr(error, "smtp_code", None)
             if not isinstance(provider_code, int):
                 provider_code = "unavailable"
+            provider_reason = getattr(error, "provider_reason", "unavailable")
+            if provider_reason not in {
+                "recipient_restricted",
+                "sender_domain_unverified",
+                "api_key_rejected",
+                "api_key_permission",
+                "api_key_restricted",
+                "api_key_suspended",
+                "quota_exceeded",
+                "validation_error",
+                "unavailable",
+            }:
+                provider_reason = "unavailable"
             LOGGER.error(
-                "One-time email delivery failed (error_type=%s, provider_code=%s).",
+                "One-time email delivery failed (error_type=%s, provider_code=%s, provider_reason=%s).",
                 type(error).__name__,
                 provider_code,
+                provider_reason,
             )
             raise HTTPException(status_code=503, detail="The code could not be delivered. Please try again later.")
         return {"message": OTP_GENERIC_MESSAGE}
