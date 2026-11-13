@@ -145,8 +145,11 @@
         input.pattern = passwordPolicyPattern;
         input.title = passwordPolicyMessage;
         const help = input.parentElement.querySelector("small");
-        if (help) help.textContent = passwordPolicyMessage;
-        else input.insertAdjacentHTML("afterend", `<small>${esc(passwordPolicyMessage)}</small>`);
+        if (help) {
+          if (help.textContent !== passwordPolicyMessage) help.textContent = passwordPolicyMessage;
+        } else {
+          input.insertAdjacentHTML("afterend", `<small>${esc(passwordPolicyMessage)}</small>`);
+        }
       }
     }
 
