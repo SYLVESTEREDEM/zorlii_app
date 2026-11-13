@@ -1,8 +1,9 @@
+import json
 import os
 import unittest
 from unittest import mock
 
-from zorlii_app.email_delivery import SMTPMailer
+from zorlii_app.email_delivery import ResendMailer, SMTPMailer, mailer_from_env
 
 
 class SMTPMailerTests(unittest.TestCase):
@@ -41,6 +42,32 @@ class SMTPMailerTests(unittest.TestCase):
         message = smtp.send_message.call_args.args[0]
         self.assertIn("Verify your Zorlii email", message["Subject"])
         self.assertIn("finish creating your account", message.get_content())
+
+
+class ResendMailerTests(unittest.TestCase):
+    def test_selects_resend_from_environment_without_smtp_configuration(self):
+        with mock.patch.dict(os.environ, {
+            "ZORLII_EMAIL_PROVIDER": "resend",
+            "ZORLII_RESEND_API_KEY": "re_test_key",
+            "ZORLII_EMAIL_FROM": "Zorlii <no-reply@auth.example.test>",
+        }, clear=True):
+            mailer = mailer_from_env()
+        self.assertIsInstance(mailer, ResendMailer)
+
+    def test_sends_plain_otp_through_resend_https_api(self):
+        with mock.patch("zorlii_app.email_delivery.urlopen") as urlopen:
+            ResendMailer("re_test_key", "Zorlii <no-reply@auth.example.test>").send_otp(
+                "member@example.test", "031947", "password_reset"
+            )
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.resend.com/emails")
+        self.assertEqual(request.get_header("Authorization"), "Bearer re_test_key")
+        payload = json.loads(request.data)
+        self.assertEqual(payload["to"], ["member@example.test"])
+        self.assertIn("password reset code", payload["subject"].lower())
+        self.assertIn("031947", payload["text"])
+        self.assertNotIn("http", payload["text"].lower())
+        urlopen.assert_called_once_with(request, timeout=15)
 
 
 if __name__ == "__main__":

@@ -298,7 +298,7 @@ class AccountApiTests(unittest.TestCase):
             response = client.post("/api/auth/forgot-password", json={"email": "valid@example.test"})
         self.assertEqual(response.status_code, 503)
         self.assertIn("SMTPAuthenticationError", captured.output[0])
-        self.assertIn("535", captured.output[0])
+        self.assertIn("provider_code=535", captured.output[0])
         self.assertNotIn("private authentication response", captured.output[0])
         self.assertNotIn("valid@example.test", captured.output[0])
 

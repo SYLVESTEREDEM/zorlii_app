@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .context_assistance import extractive_context
 from .db import Database
-from .email_delivery import SMTPConfigurationError, SMTPMailer
+from .email_delivery import EmailConfigurationError, mailer_from_env
 from .recommendations import recommend
 from .security import hash_password, new_session_token, token_digest, verify_password
 
@@ -320,17 +320,17 @@ def new_app(database=None, mailer=None):
     @app.get("/api/health")
     def health():
         try:
-            SMTPMailer.from_env()
+            mailer_from_env()
             email = "configured"
-        except (SMTPConfigurationError, ValueError):
+        except (EmailConfigurationError, ValueError):
             email = "not_configured"
         return {"status": "ok", "email": email}
 
     def issue_otp(purpose, email, request, registration=None):
         try:
             secret = otp_secret()
-            sender = mailer or SMTPMailer.from_env()
-        except (OTPConfigurationError, SMTPConfigurationError, ValueError):
+            sender = mailer or mailer_from_env()
+        except (OTPConfigurationError, EmailConfigurationError, ValueError):
             raise HTTPException(status_code=503, detail="One-time email verification is not configured.")
 
         now = int(time.time())
@@ -417,13 +417,15 @@ def new_app(database=None, mailer=None):
             if challenge_id is not None:
                 with db.transaction() as connection:
                     connection.execute("DELETE FROM otp_challenges WHERE id=?", (challenge_id,))
-            smtp_code = getattr(error, "smtp_code", None)
-            if not isinstance(smtp_code, int):
-                smtp_code = "unavailable"
+            provider_code = getattr(error, "code", None)
+            if not isinstance(provider_code, int):
+                provider_code = getattr(error, "smtp_code", None)
+            if not isinstance(provider_code, int):
+                provider_code = "unavailable"
             LOGGER.error(
-                "One-time email delivery failed (error_type=%s, smtp_code=%s).",
+                "One-time email delivery failed (error_type=%s, provider_code=%s).",
                 type(error).__name__,
-                smtp_code,
+                provider_code,
             )
             raise HTTPException(status_code=503, detail="The code could not be delivered. Please try again later.")
         return {"message": OTP_GENERIC_MESSAGE}
