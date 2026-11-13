@@ -145,6 +145,8 @@ class ResendMailer:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "zorlii-app/1.0 (+https://zorlii.app)",
             },
             method="POST",
         )
