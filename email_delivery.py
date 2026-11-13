@@ -25,9 +25,9 @@ def _resend_error_reason(error):
     try:
         body = json.loads(error.read().decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return "unavailable"
+        return "non_json_response"
     if not isinstance(body, dict):
-        return "unavailable"
+        return "unstructured_json_response"
 
     name = body.get("name")
     message = body.get("message")
@@ -48,6 +48,11 @@ def _resend_error_reason(error):
         return "quota_exceeded"
     if name == "validation_error":
         return "validation_error"
+    if isinstance(name, str) and 1 <= len(name) <= 64 and all(
+        character.isascii() and (character.isalnum() or character == "_")
+        for character in name
+    ):
+        return name.lower()
     return "unavailable"
 
 

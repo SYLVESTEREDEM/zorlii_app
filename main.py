@@ -423,17 +423,7 @@ def new_app(database=None, mailer=None):
             if not isinstance(provider_code, int):
                 provider_code = "unavailable"
             provider_reason = getattr(error, "provider_reason", "unavailable")
-            if provider_reason not in {
-                "recipient_restricted",
-                "sender_domain_unverified",
-                "api_key_rejected",
-                "api_key_permission",
-                "api_key_restricted",
-                "api_key_suspended",
-                "quota_exceeded",
-                "validation_error",
-                "unavailable",
-            }:
+            if not isinstance(provider_reason, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", provider_reason):
                 provider_reason = "unavailable"
             LOGGER.error(
                 "One-time email delivery failed (error_type=%s, provider_code=%s, provider_reason=%s).",

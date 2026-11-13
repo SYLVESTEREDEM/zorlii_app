@@ -86,6 +86,20 @@ class ResendMailerTests(unittest.TestCase):
         self.assertEqual(raised.exception.provider_reason, "sender_domain_unverified")
         self.assertNotIn("auth.example.test", str(raised.exception))
 
+    def test_preserves_only_a_sanitized_resend_error_name(self):
+        body = json.dumps({
+            "name": "sender_policy_403",
+            "message": "Do not log this provider message.",
+        }).encode("utf-8")
+        error = HTTPError("https://api.resend.com/emails", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch("zorlii_app.email_delivery.urlopen", side_effect=error):
+            with self.assertRaises(ResendAPIError) as raised:
+                ResendMailer("re_test_key", "Zorlii <no-reply@auth.example.test>").send_otp(
+                    "member@example.test", "031947", "register"
+                )
+        self.assertEqual(raised.exception.provider_reason, "sender_policy_403")
+        self.assertNotIn("Do not log", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
