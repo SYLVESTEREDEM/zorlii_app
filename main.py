@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .context_assistance import extractive_context
 from .db import Database
-from .email_delivery import SMTPConfigurationError, SMTPMailer
+from .email_delivery import SMTPConfigurationError, mailer_from_env
 from .recommendations import recommend
 from .security import hash_password, new_session_token, token_digest, verify_password
 
@@ -320,7 +320,7 @@ def new_app(database=None, mailer=None):
     @app.get("/api/health")
     def health():
         try:
-            SMTPMailer.from_env()
+            mailer_from_env()
             email = "configured"
         except (SMTPConfigurationError, ValueError):
             email = "not_configured"
@@ -329,7 +329,7 @@ def new_app(database=None, mailer=None):
     def issue_otp(purpose, email, request, registration=None):
         try:
             secret = otp_secret()
-            sender = mailer or SMTPMailer.from_env()
+            sender = mailer or mailer_from_env()
         except (OTPConfigurationError, SMTPConfigurationError, ValueError):
             raise HTTPException(status_code=503, detail="One-time email verification is not configured.")
 
