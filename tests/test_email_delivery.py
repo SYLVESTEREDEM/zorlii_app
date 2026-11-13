@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -5,6 +6,17 @@ from zorlii_app.email_delivery import SMTPMailer
 
 
 class SMTPMailerTests(unittest.TestCase):
+    def test_gmail_app_password_whitespace_is_normalized(self):
+        with mock.patch.dict(os.environ, {
+            "ZORLII_SMTP_HOST": "smtp.gmail.com",
+            "ZORLII_SMTP_PORT": "587",
+            "ZORLII_SMTP_USER": "mailer@example.test",
+            "ZORLII_SMTP_PASSWORD": "ab cd ef gh ij kl mn op",
+            "ZORLII_SMTP_FROM": "mailer@example.test",
+        }, clear=True):
+            mailer = SMTPMailer.from_env()
+        self.assertEqual(mailer.password, "abcdefghijklmnop")
+
     def test_sends_plain_one_time_code_without_reset_link(self):
         smtp = mock.MagicMock()
         smtp.__enter__.return_value = smtp

@@ -413,11 +413,18 @@ def new_app(database=None, mailer=None):
 
         try:
             sender.send_otp(email, raw_code, purpose)
-        except Exception:
+        except Exception as error:
             if challenge_id is not None:
                 with db.transaction() as connection:
                     connection.execute("DELETE FROM otp_challenges WHERE id=?", (challenge_id,))
-            LOGGER.error("One-time email delivery failed.")
+            smtp_code = getattr(error, "smtp_code", None)
+            if not isinstance(smtp_code, int):
+                smtp_code = "unavailable"
+            LOGGER.error(
+                "One-time email delivery failed (error_type=%s, smtp_code=%s).",
+                type(error).__name__,
+                smtp_code,
+            )
             raise HTTPException(status_code=503, detail="The code could not be delivered. Please try again later.")
         return {"message": OTP_GENERIC_MESSAGE}
 

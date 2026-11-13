@@ -1,4 +1,5 @@
 import os
+import smtplib
 import sqlite3
 import time
 import unittest
@@ -24,6 +25,11 @@ class CapturingMailer:
 class FailingMailer:
     def send_otp(self, recipient, code, purpose):
         raise RuntimeError("private delivery failure")
+
+
+class SMTPAuthFailingMailer:
+    def send_otp(self, recipient, code, purpose):
+        raise smtplib.SMTPAuthenticationError(535, b"private authentication response")
 
 
 class AccountApiTests(unittest.TestCase):
@@ -285,6 +291,16 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(known.json(), unknown.json())
         with db.locked_connection() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM otp_challenges").fetchone()[0], 0)
+
+    def test_delivery_logs_safe_smtp_failure_details(self):
+        client = TestClient(new_app(Database(":memory:"), SMTPAuthFailingMailer()))
+        with self.assertLogs("zorlii.recovery", level="ERROR") as captured:
+            response = client.post("/api/auth/forgot-password", json={"email": "valid@example.test"})
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("SMTPAuthenticationError", captured.output[0])
+        self.assertIn("535", captured.output[0])
+        self.assertNotIn("private authentication response", captured.output[0])
+        self.assertNotIn("valid@example.test", captured.output[0])
 
     def test_registration_wrong_code_attempt_limit_and_resend_invalidation(self):
         body = {

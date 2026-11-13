@@ -22,6 +22,8 @@ class SMTPMailer:
         sender = os.environ.get("ZORLII_SMTP_FROM", "").strip()
         username = os.environ.get("ZORLII_SMTP_USER", "").strip()
         password = os.environ.get("ZORLII_SMTP_PASSWORD", "")
+        if host.lower() == "smtp.gmail.com":
+            password = "".join(password.split())
         if not host or not sender:
             raise SMTPConfigurationError("SMTP is not configured.")
         if bool(username) != bool(password):
