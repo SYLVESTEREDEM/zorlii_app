@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .context_assistance import extractive_context
 from .db import Database
@@ -46,14 +47,29 @@ DB = Database()
 LOGGER = logging.getLogger("zorlii.recovery")
 OTP_GENERIC_MESSAGE = "If the details can be verified, a one-time code may be sent. This response does not confirm delivery."
 PASSWORD_POLICY_MESSAGE = "Password must be 4–128 characters and include an uppercase letter, a lowercase letter, a number, and a special character."
-AVATAR_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_MAX_BYTES = 50 * 1024 * 1024
 AVATAR_MAX_DIMENSION = 4096
 AVATAR_MAX_PIXELS = 16_000_000
 AVATAR_TYPES = {
     "image/jpeg": "JPEG",
     "image/png": "PNG",
     "image/webp": "WEBP",
+    "image/gif": "GIF",
 }
+POST_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+POST_MEDIA_MAX_FILES = 4
+POST_IMAGE_TYPES = {
+    "JPEG": ("image/jpeg", "jpg"),
+    "PNG": ("image/png", "png"),
+    "WEBP": ("image/webp", "webp"),
+    "GIF": ("image/gif", "gif"),
+}
+POST_VIDEO_TYPES = {
+    "video/mp4": "mp4",
+    "video/quicktime": "mov",
+    "video/webm": "webm",
+}
+POST_MEDIA_TYPES = {item[0] for item in POST_IMAGE_TYPES.values()} | set(POST_VIDEO_TYPES)
 
 
 class OTPConfigurationError(RuntimeError):
@@ -80,6 +96,42 @@ def otp_digest(secret, purpose, email, code):
 
 def otp_rate_digest(secret, kind, value):
     return hmac.new(secret, f"rate:{kind}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def post_media_type(content, declared_type):
+    declared_type = (declared_type or "").split(";", 1)[0].strip().lower()
+    if declared_type and declared_type != "application/octet-stream" and declared_type not in POST_MEDIA_TYPES:
+        raise HTTPException(status_code=415, detail="This media could not be uploaded.")
+
+    try:
+        with Image.open(BytesIO(content)) as image:
+            media_type, extension = POST_IMAGE_TYPES.get(image.format, (None, None))
+            if media_type:
+                if declared_type and declared_type not in {media_type, "application/octet-stream"}:
+                    raise HTTPException(status_code=400, detail="This media could not be processed.")
+                if image.width > AVATAR_MAX_DIMENSION * 2 or image.height > AVATAR_MAX_DIMENSION * 2:
+                    raise HTTPException(status_code=400, detail="This media could not be processed.")
+                if image.width * image.height > AVATAR_MAX_PIXELS * 4:
+                    raise HTTPException(status_code=400, detail="This media could not be processed.")
+                image.verify()
+                return media_type, extension
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        pass
+
+    if len(content) >= 12 and content[4:8] == b"ftyp":
+        detected_type = "video/quicktime" if content[8:12] == b"qt  " else "video/mp4"
+        if declared_type and declared_type not in {detected_type, "application/octet-stream"}:
+            raise HTTPException(status_code=400, detail="This media could not be processed.")
+        return detected_type, POST_VIDEO_TYPES[detected_type]
+    if content.startswith(b"\x1aE\xdf\xa3"):
+        if declared_type and declared_type not in {"video/webm", "application/octet-stream"}:
+            raise HTTPException(status_code=400, detail="This media could not be processed.")
+        return "video/webm", POST_VIDEO_TYPES["video/webm"]
+    if declared_type in POST_VIDEO_TYPES:
+        raise HTTPException(status_code=400, detail="This media could not be processed.")
+    raise HTTPException(status_code=415, detail="This media could not be uploaded.")
 
 
 class RegisterInput(BaseModel):
@@ -198,6 +250,16 @@ class PostInput(BaseModel):
         return value.strip()
 
 
+class MediaPostInput(BaseModel):
+    body: str = Field(default="", max_length=5000)
+    visibility: str = Field(default="public", pattern="^(public|followers|private)$")
+
+    @field_validator("body")
+    @classmethod
+    def trim_body(cls, value):
+        return value.strip()
+
+
 class MessageInput(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
 
@@ -259,15 +321,18 @@ def public_user(row):
     return result
 
 
-def new_app(database=None, mailer=None, avatar_directory=None):
+def new_app(database=None, mailer=None, avatar_directory=None, media_directory=None):
     db = database or DB
     db.connect()
     if avatar_directory is not None:
         avatar_dir = Path(avatar_directory)
+        media_dir = Path(media_directory) if media_directory is not None else avatar_dir.parent / "media"
     elif str(db.path) == ":memory:":
         avatar_dir = Path(__file__).with_name("data") / "avatars"
+        media_dir = Path(media_directory) if media_directory is not None else Path(__file__).with_name("data") / "media"
     else:
         avatar_dir = Path(db.path).expanduser().parent / "avatars"
+        media_dir = Path(media_directory) if media_directory is not None else Path(db.path).expanduser().parent / "media"
     app = FastAPI(title="Zorlii API", version="1.0.0")
     app.add_middleware(
         CORSMiddleware,
@@ -322,7 +387,17 @@ def new_app(database=None, mailer=None, avatar_directory=None):
                 return None
             if row["visibility"] == "followers" and not row["followed"]:
                 return None
-        return dict(row)
+        result = dict(row)
+        media = connection.execute(
+            """SELECT id,media_type FROM post_media
+               WHERE post_id=? ORDER BY position,id""",
+            (post_id,),
+        ).fetchall()
+        result["media"] = [
+            {"id": item["id"], "media_type": item["media_type"], "url": f"/api/post-media/{item['id']}"}
+            for item in media
+        ]
+        return result
 
     def post_payload(row):
         return {
@@ -344,6 +419,7 @@ def new_app(database=None, mailer=None, avatar_directory=None):
             "reaction_count": row["reaction_count"],
             "reacted": bool(row["reacted"]),
             "bookmarked": bool(row["bookmarked"]),
+            "media": row.get("media", []),
         }
 
     @app.get("/api/health")
@@ -375,31 +451,74 @@ def new_app(database=None, mailer=None, avatar_directory=None):
             headers={"Cache-Control": "public, max-age=3600"},
         )
 
+    @app.get("/api/post-media/{media_id}")
+    def get_post_media(media_id: int, user: User):
+        with db.locked_connection() as connection:
+            row = connection.execute(
+                """SELECT pm.filename,pm.media_type,pm.post_id
+                   FROM post_media pm WHERE pm.id=?""",
+                (media_id,),
+            ).fetchone()
+            if row is None or visible_post(connection, row["post_id"], user["id"]) is None:
+                raise HTTPException(status_code=404, detail="Media not found.")
+        if row["media_type"] not in POST_MEDIA_TYPES or not re.fullmatch(
+            r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", row["filename"]
+        ):
+            raise HTTPException(status_code=404, detail="Media not found.")
+        path = media_dir / row["filename"]
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Media not found.")
+        return FileResponse(
+            path,
+            media_type=row["media_type"],
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @app.put("/api/profile/avatar")
     async def upload_avatar(request: Request, user: User):
         request_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if request_type not in AVATAR_TYPES and request_type != "application/json":
-            raise HTTPException(status_code=415, detail="Choose a JPEG, PNG, or WebP image.")
-        request_limit = AVATAR_MAX_BYTES if request_type in AVATAR_TYPES else (AVATAR_MAX_BYTES * 4 // 3) + 4096
+        if request_type not in AVATAR_TYPES and request_type not in {"application/json", "multipart/form-data", "application/octet-stream"}:
+            raise HTTPException(status_code=415, detail="This image could not be uploaded.")
+        request_limit = (
+            AVATAR_MAX_BYTES + 256 * 1024 if request_type == "multipart/form-data"
+            else AVATAR_MAX_BYTES if request_type in AVATAR_TYPES
+            else (AVATAR_MAX_BYTES * 4 // 3) + 4096
+        )
         content_length = request.headers.get("content-length")
         if content_length:
             try:
                 if int(content_length) > request_limit:
-                    raise HTTPException(status_code=413, detail="Profile photos must be 2 MB or smaller.")
+                    raise HTTPException(status_code=413, detail="This image could not be processed.")
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid content length.")
-        chunks = []
-        size = 0
-        async for chunk in request.stream():
-            size += len(chunk)
-            if size > request_limit:
-                raise HTTPException(status_code=413, detail="Profile photos must be 2 MB or smaller.")
-            chunks.append(chunk)
-        if not size:
-            raise HTTPException(status_code=400, detail="Choose a photo to upload.")
-
-        content = b"".join(chunks)
-        if request_type == "application/json":
+        if request_type == "multipart/form-data":
+            form = await request.form(max_files=1, max_fields=1)
+            try:
+                upload = form.get("file")
+                if not isinstance(upload, StarletteUploadFile):
+                    raise HTTPException(status_code=400, detail="Choose an image to upload.")
+                content_type = (upload.content_type or "").split(";", 1)[0].strip().lower()
+                if content_type not in AVATAR_TYPES and content_type != "application/octet-stream":
+                    raise HTTPException(status_code=415, detail="This image could not be uploaded.")
+                content = await upload.read(AVATAR_MAX_BYTES + 1)
+            finally:
+                await form.close()
+            if len(content) > AVATAR_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="This image could not be processed.")
+        elif request_type == "application/json":
+            chunks = []
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > request_limit:
+                    raise HTTPException(status_code=413, detail="This image could not be processed.")
+                chunks.append(chunk)
+            if not size:
+                raise HTTPException(status_code=400, detail="Choose an image to upload.")
+            content = b"".join(chunks)
             try:
                 payload = json.loads(content)
                 content_type = payload["content_type"]
@@ -408,12 +527,30 @@ def new_app(database=None, mailer=None, avatar_directory=None):
                     raise ValueError
                 content = base64.b64decode(encoded, validate=True)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                raise HTTPException(status_code=400, detail="Choose a valid JPEG, PNG, or WebP image.")
+                raise HTTPException(status_code=400, detail="This image could not be processed.")
             if len(content) > AVATAR_MAX_BYTES:
-                raise HTTPException(status_code=413, detail="Profile photos must be 2 MB or smaller.")
+                raise HTTPException(status_code=413, detail="This image could not be processed.")
         else:
             content_type = request_type
+            chunks = []
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > AVATAR_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="This image could not be processed.")
+                chunks.append(chunk)
+            if not size:
+                raise HTTPException(status_code=400, detail="Choose an image to upload.")
+            content = b"".join(chunks)
         try:
+            if content_type == "application/octet-stream":
+                with Image.open(BytesIO(content)) as image:
+                    content_type = next(
+                        (media_type for media_type, image_format in AVATAR_TYPES.items() if image.format == image_format),
+                        "",
+                    )
+                if not content_type:
+                    raise ValueError("Unsupported image format.")
             source = BytesIO(content)
             with Image.open(source) as image:
                 if image.format != AVATAR_TYPES[content_type]:
@@ -438,7 +575,7 @@ def new_app(database=None, mailer=None, avatar_directory=None):
                 image.save(output, format="JPEG", quality=86, optimize=True)
                 image_bytes = output.getvalue()
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
-            raise HTTPException(status_code=400, detail="Upload a valid JPEG, PNG, or WebP image.")
+            raise HTTPException(status_code=400, detail="This image could not be processed.")
 
         avatar_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{uuid.uuid4().hex}.jpg"
@@ -811,6 +948,20 @@ def new_app(database=None, mailer=None, avatar_directory=None):
                    WHERE user_id=? ORDER BY id""",
                 (user["id"],),
             ).fetchall()
+            exported_posts = []
+            for post in posts:
+                post_data = dict(post)
+                post_data["media"] = [
+                    {
+                        "media_type": item["media_type"],
+                        "url": f"/api/post-media/{item['id']}",
+                    }
+                    for item in connection.execute(
+                        "SELECT id,media_type FROM post_media WHERE post_id=? ORDER BY position,id",
+                        (post["id"],),
+                    ).fetchall()
+                ]
+                exported_posts.append(post_data)
             replies = connection.execute(
                 """SELECT r.id,r.post_id,r.body,r.created_at,u.username AS post_author
                    FROM replies r JOIN posts p ON p.id=r.post_id
@@ -875,7 +1026,7 @@ def new_app(database=None, mailer=None, avatar_directory=None):
             ).fetchall()
         export = {
             "account": profile_data,
-            "posts": [dict(row) for row in posts],
+            "posts": exported_posts,
             "replies": [dict(row) for row in replies],
             "reactions": [dict(row) for row in reactions],
             "bookmarks": [dict(row) for row in bookmarks],
@@ -898,6 +1049,11 @@ def new_app(database=None, mailer=None, avatar_directory=None):
                    JOIN profiles p ON p.user_id=u.id WHERE u.id=?""",
                 (user["id"],),
             ).fetchone()
+            media_rows = connection.execute(
+                """SELECT pm.filename FROM post_media pm
+                   JOIN posts p ON p.id=pm.post_id WHERE p.user_id=?""",
+                (user["id"],),
+            ).fetchall()
         if row is None or not verify_password(data.password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="Password is incorrect.")
         with db.transaction() as connection:
@@ -910,6 +1066,9 @@ def new_app(database=None, mailer=None, avatar_directory=None):
             )
         if row["avatar_filename"] and re.fullmatch(r"[a-f0-9]{32}\.jpg", row["avatar_filename"]):
             (avatar_dir / row["avatar_filename"]).unlink(missing_ok=True)
+        for media_row in media_rows:
+            if re.fullmatch(r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", media_row["filename"]):
+                (media_dir / media_row["filename"]).unlink(missing_ok=True)
         response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="strict")
         return {"message": "Your account and account-owned content have been permanently deleted."}
 
@@ -1048,6 +1207,75 @@ def new_app(database=None, mailer=None, avatar_directory=None):
             row = visible_post(connection, post_id, user["id"])
         return {"post": post_payload(row)}
 
+    @app.post("/api/posts/media", status_code=201)
+    async def create_post_with_media(request: Request, user: User):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                request_size = int(content_length)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid content length.")
+            if request_size < 0:
+                raise HTTPException(status_code=400, detail="Invalid content length.")
+            if request_size > POST_MEDIA_MAX_BYTES * POST_MEDIA_MAX_FILES + 256 * 1024:
+                raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
+        form = await request.form(max_files=POST_MEDIA_MAX_FILES + 1, max_fields=3)
+        try:
+            body = form.get("body", "")
+            visibility = form.get("visibility", "public")
+            uploads = form.getlist("media")
+            if not isinstance(body, str) or not isinstance(visibility, str):
+                raise HTTPException(status_code=422, detail="Post details are invalid.")
+            if any(not isinstance(upload, StarletteUploadFile) for upload in uploads):
+                raise HTTPException(status_code=400, detail="The selected media could not be uploaded.")
+            if len(uploads) > POST_MEDIA_MAX_FILES:
+                raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
+            try:
+                data = MediaPostInput(body=body, visibility=visibility)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail="Post details are invalid.") from error
+            if not uploads:
+                raise HTTPException(status_code=422, detail="Choose media to upload.")
+            stored_media = []
+            media_dir.mkdir(parents=True, exist_ok=True)
+            completed = False
+            try:
+                for position, upload in enumerate(uploads):
+                    content = await upload.read(POST_MEDIA_MAX_BYTES + 1)
+                    if len(content) > POST_MEDIA_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
+                    if not content:
+                        raise HTTPException(status_code=400, detail="The selected media could not be uploaded.")
+                    media_type, extension = post_media_type(content, upload.content_type)
+                    filename = f"{uuid.uuid4().hex}.{extension}"
+                    stored_media.append({
+                        "filename": filename,
+                        "media_type": media_type,
+                        "position": position,
+                    })
+                    (media_dir / filename).write_bytes(content)
+                with db.transaction() as connection:
+                    cursor = connection.execute(
+                        "INSERT INTO posts(user_id,body,visibility) VALUES(?,?,?)",
+                        (user["id"], data.body, data.visibility),
+                    )
+                    post_id = cursor.lastrowid
+                    for item in stored_media:
+                        connection.execute(
+                            """INSERT INTO post_media(post_id,filename,media_type,position)
+                               VALUES(?,?,?,?)""",
+                            (post_id, item["filename"], item["media_type"], item["position"]),
+                        )
+                    row = visible_post(connection, post_id, user["id"])
+                completed = True
+            finally:
+                if not completed:
+                    for item in stored_media:
+                        (media_dir / item["filename"]).unlink(missing_ok=True)
+            return {"post": post_payload(row)}
+        finally:
+            await form.close()
+
     @app.get("/api/feed")
     def feed(user: User, scope: str = "all", limit: int = Query(default=30, ge=1, le=100), offset: int = Query(default=0, ge=0)):
         if scope not in {"all", "following", "bookmarks"}:
@@ -1101,10 +1329,17 @@ def new_app(database=None, mailer=None, avatar_directory=None):
     @app.delete("/api/posts/{post_id}")
     def delete_post(post_id: int, user: User):
         with db.transaction() as connection:
+            media_rows = connection.execute(
+                "SELECT filename FROM post_media WHERE post_id=?",
+                (post_id,),
+            ).fetchall()
             cursor = connection.execute("DELETE FROM posts WHERE id=? AND user_id=?", (post_id, user["id"]))
             if cursor.rowcount == 0:
                 exists = connection.execute("SELECT 1 FROM posts WHERE id=?", (post_id,)).fetchone()
                 raise HTTPException(status_code=404, detail="Post not found or unavailable.")
+        for media_row in media_rows:
+            if re.fullmatch(r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", media_row["filename"]):
+                (media_dir / media_row["filename"]).unlink(missing_ok=True)
         return {"ok": True}
 
     @app.post("/api/posts/{post_id}/replies", status_code=201)

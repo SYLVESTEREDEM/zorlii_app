@@ -126,6 +126,20 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("Privacy &amp; local tools", html)
         self.assertIn("Privacy & local tools", mobile)
 
+    def test_media_uploads_and_white_card_text_are_available_without_limit_copy(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn('accept="image/*,video/*" multiple', html)
+        self.assertIn("api('/api/posts/media'", html)
+        self.assertIn('<video controls preload="metadata"', html)
+        self.assertIn('mediaTypes: ["images", "videos"]', mobile)
+        self.assertIn('"/api/posts/media"', mobile)
+        self.assertIn("VideoView", mobile)
+        self.assertIn(".notification-item p{margin:5px 0 10px;color:#000}", html)
+        self.assertIn("background:#fff!important;color:#000!important", html)
+        self.assertNotIn("Profile photos must be 2 MB", html)
+        self.assertNotIn("2 MB", mobile)
+
 
 if __name__ == "__main__":
     unittest.main()

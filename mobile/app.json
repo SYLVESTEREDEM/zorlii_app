@@ -13,7 +13,8 @@
         {
           "photosPermission": "Allow Zorlii to choose a profile photo."
         }
-      ]
+      ],
+      "expo-video"
     ],
     "ios": {
       "supportsTablet": true,

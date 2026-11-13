@@ -5,14 +5,26 @@ import {
 } from "react-native";
 import * as SecureStore from "expo-secure-store";
 import * as ImagePicker from "expo-image-picker";
+import { VideoView, useVideoPlayer } from "expo-video";
 import { StatusBar } from "expo-status-bar";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 type User = { id: number; username: string; email: string; display_name: string; bio: string; avatar_url: string | null; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean };
-type Post = { id: number; body: string; created_at: string; reaction_count: number; reply_count: number; reacted: boolean; bookmarked: boolean; author: { id: number; username: string; display_name: string; avatar_url?: string | null } };
+type PostMedia = { id: number; url: string; media_type: string };
+type Post = { id: number; body: string; created_at: string; reaction_count: number; reply_count: number; reacted: boolean; bookmarked: boolean; media?: PostMedia[]; author: { id: number; username: string; display_name: string; avatar_url?: string | null } };
 type Conversation = { id: number; last_message?: string; participants: { id: number; username: string; display_name: string; avatar_url?: string | null }[] };
 type Member = { id: number; username: string; display_name: string; bio: string; avatar_url?: string | null };
 type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction"; post_id: number | null; created_at: string; read: boolean; actor: { username: string; display_name: string; avatar_url?: string | null } };
+type NativeFilePart = { uri: string; name: string; type: string };
+type NativeUploadFormData = FormData & { append(name: string, value: string | NativeFilePart): void };
+
+function PostVideo({ uri, token }: { uri: string; token: string }) {
+  const player = useVideoPlayer(
+    { uri, headers: { Authorization: `Bearer ${token}` } },
+    instance => { instance.loop = false; },
+  );
+  return <VideoView style={styles.postVideo} player={player} nativeControls contentFit="contain" />;
+}
 
 function passwordPolicyError(password: string) {
   if (password.length < 4 || password.length > 128) return "Use 4–128 characters.";
@@ -61,6 +73,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [posts, setPosts] = useState<Post[]>([]);
+  const [postMedia, setPostMedia] = useState<ImagePicker.ImagePickerAsset[]>([]);
   const [profilePosts, setProfilePosts] = useState<Post[]>([]);
   const [replies, setReplies] = useState<Record<number, any[]>>({});
   const [scope, setScope] = useState("all");
@@ -88,6 +101,16 @@ export default function App() {
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(result.detail || "Could not connect to Zorlii. Check your API URL and try again.");
+    return result;
+  }
+  async function uploadRequest(path: string, body: FormData, method = "POST") {
+    const response = await fetch(`${API_URL}${path}`, {
+      method,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || "Could not upload this media. Please try again.");
     return result;
   }
   function update(key: string, value: string) { setForm(current => ({ ...current, [key]: value })); setError(""); }
@@ -127,24 +150,33 @@ export default function App() {
         return;
       }
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images"], allowsEditing: true, aspect: [1, 1], quality: 0.85, base64: true,
+        mediaTypes: ["images"], allowsEditing: true, aspect: [1, 1], quality: 0.95,
       });
       if (result.canceled) return;
       const asset = result.assets[0];
-      const contentType = asset.mimeType?.toLowerCase() || "image/jpeg";
-      if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
-        throw new Error("Choose a JPEG, PNG, or WebP image.");
-      }
-      if ((asset.fileSize && asset.fileSize > 2 * 1024 * 1024)
-        || (asset.base64 && asset.base64.length > Math.ceil((2 * 1024 * 1024) * 4 / 3))) {
-        throw new Error("Profile photos must be 2 MB or smaller.");
-      }
-      if (!asset.base64) throw new Error("Could not read that photo. Please choose another.");
-      await request("/api/profile/avatar", "PUT", {
-        content_type: contentType, image_base64: asset.base64,
+      const contentType = asset.mimeType?.toLowerCase() || "application/octet-stream";
+      const body = new FormData() as NativeUploadFormData;
+      body.append("file", {
+        uri: asset.uri,
+        name: asset.fileName || `profile.${contentType.split("/")[1] || "jpg"}`,
+        type: contentType,
       });
+      await uploadRequest("/api/profile/avatar", body, "PUT");
       setMe((await request("/api/me")).user);
       Alert.alert("Photo updated", "Your profile photo is ready.");
+    } catch (e) { fail(e); }
+  }
+  async function pickPostMedia() {
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Media access needed", "Allow photo-library access to attach media to a post.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images", "videos"], allowsMultipleSelection: true, selectionLimit: 4, quality: 1,
+      });
+      if (!result.canceled) setPostMedia(result.assets);
     } catch (e) { fail(e); }
   }
   function confirmAvatarRemoval() {
@@ -242,7 +274,7 @@ export default function App() {
   async function logout() {
     try { await request("/api/auth/logout", "POST"); } catch { }
     await SecureStore.deleteItemAsync("zorlii_session");
-    setToken(""); setMe(null); setScreen("login"); setForm({});
+    setToken(""); setMe(null); setScreen("login"); setForm({}); setPostMedia([]);
   }
   async function exportAccount() {
     try {
@@ -268,7 +300,7 @@ export default function App() {
           try {
             await request("/api/account", "DELETE", { password: form.delete_password || "" });
             await SecureStore.deleteItemAsync("zorlii_session");
-            setToken(""); setMe(null); setForm({}); setScreen("login");
+            setToken(""); setMe(null); setForm({}); setPostMedia([]); setScreen("login");
             setError("Your account and account-owned content have been deleted.");
           } catch (e) { fail(e); }
           finally { setLoading(false); }
@@ -287,6 +319,35 @@ export default function App() {
   async function startConversation(username: string) {
     try { const data = await request("/api/conversations", "POST", { username }); await loadInbox(); await loadConversation(data.id); }
     catch (e) { fail(e); }
+  }
+  async function sharePost() {
+    if (!(form.post || "").trim() && !postMedia.length) {
+      setError("Write a thought or add media before sharing.");
+      return;
+    }
+    setLoading(true);
+    try {
+      if (postMedia.length) {
+        const body = new FormData() as NativeUploadFormData;
+        body.append("body", form.post || "");
+        body.append("visibility", form.visibility || "public");
+        postMedia.forEach((asset, index) => {
+          const type = asset.mimeType?.toLowerCase() || "application/octet-stream";
+          body.append("media", {
+            uri: asset.uri,
+            name: asset.fileName || `media-${index}.${type.split("/")[1] || "bin"}`,
+            type,
+          });
+        });
+        await uploadRequest("/api/posts/media", body);
+      } else {
+        await request("/api/posts", "POST", { body: form.post, visibility: form.visibility || "public" });
+      }
+      setPostMedia([]);
+      update("post", "");
+      await loadFeed();
+    } catch (e) { fail(e); }
+    finally { setLoading(false); }
   }
 
   const field = (name: string, placeholder: string, secure = false, multiline = false) => {
@@ -340,7 +401,10 @@ export default function App() {
   </View>;
   const postCard = (post: Post) => <View key={post.id} style={styles.post}>
     <View style={styles.postAuthor}><Avatar user={post.author} /><View><Text style={styles.author}>{post.author.display_name}</Text><Text style={styles.handle}>@{post.author.username}</Text></View></View>
-    <Text style={styles.postBody}>{post.body}</Text>
+    {post.body ? <Text style={styles.postBody}>{post.body}</Text> : null}
+    {post.media?.map(media => media.media_type.startsWith("video/")
+      ? <PostVideo key={media.id} uri={`${API_URL}${media.url}`} token={token} />
+      : <Image key={media.id} source={{ uri: `${API_URL}${media.url}`, headers: { Authorization: `Bearer ${token}` } }} style={styles.postImage} resizeMode="contain" />)}
     <View style={styles.actions}>
       {button(`${post.reacted ? "♥" : "♡"} ${post.reaction_count}`, () => togglePost(post, "reaction"), true)}
       {button(post.bookmarked ? "Saved" : "Save", () => togglePost(post, "bookmark"), true)}
@@ -478,7 +542,7 @@ export default function App() {
       <View style={styles.profileHero}><Avatar user={me} size={88} /><View style={{ flex: 1 }}><Text style={styles.title}>{me?.display_name || "Your profile"}</Text><Text style={styles.handle}>@{me?.username} · {me?.email}</Text></View></View>
       {button(me?.avatar_url ? "Change profile photo" : "Add profile photo", pickAvatar, true)}
       {me?.avatar_url ? button("Remove profile photo", confirmAvatarRemoval, true) : null}
-      <Text style={styles.copy}>Choose a JPEG, PNG, or WebP image up to 2 MB. Your photo appears with your profile and posts.</Text>
+      <Text style={styles.copy}>Your photo appears with your profile and posts.</Text>
       <View style={styles.row}><Text style={styles.copy}>{followerCount} followers</Text><Text style={styles.copy}>{followingCount} following</Text></View>
       <Text style={styles.section}>Followers</Text>
       {followers.map(person => <View key={person.id} style={styles.relationshipRow}>
@@ -550,7 +614,14 @@ export default function App() {
       <View style={styles.row}>{button("Everyone", () => loadFeed("all"), true)}{button("Following", () => loadFeed("following"), true)}{button("Saved", () => loadFeed("bookmarks"), true)}</View>
       <TextInput ref={composerRef} accessibilityLabel="Write a post" placeholder="What would you like to share?" multiline maxLength={5000} value={form.post || ""} onChangeText={value => update("post", value)} style={[styles.input, styles.multiline]} />
       <View style={styles.row}><Text style={styles.copy}>Visible to: </Text><Pressable onPress={() => update("visibility", form.visibility === "public" ? "followers" : form.visibility === "followers" ? "private" : "public")}><Text style={styles.link}>{form.visibility || "public"} ⌄</Text></Pressable></View>
-      {button("Share thought", async () => { try { await request("/api/posts", "POST", { body: form.post, visibility: form.visibility || "public" }); update("post", ""); await loadFeed(); } catch (e) { fail(e); } })}
+      <View style={styles.row}>{button("Add photos or videos", pickPostMedia, true)}{postMedia.length ? button("Clear media", () => setPostMedia([]), true) : null}</View>
+      {postMedia.length ? <ScrollView horizontal style={styles.mediaSelection} contentContainerStyle={styles.mediaSelectionContent}>
+        {postMedia.map((asset, index) => <View key={`${asset.assetId || asset.uri}-${index}`} style={styles.mediaSelectionItem}>
+          {asset.type === "video" ? <Text style={styles.mediaSelectionText}>Video</Text> : <Image source={{ uri: asset.uri }} style={styles.mediaSelectionImage} />}
+          <Pressable accessibilityRole="button" accessibilityLabel="Remove selected media" style={styles.mediaRemove} onPress={() => setPostMedia(current => current.filter((_, itemIndex) => itemIndex !== index))}><Text style={styles.mediaRemoveText}>×</Text></Pressable>
+        </View>)}
+      </ScrollView> : null}
+      {button("Share thought", sharePost)}
       {loading ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} /> : posts.map(post => postCard(post))}
       {!loading && posts.length === 0 ? <View style={styles.empty}><BrandHalo size={58} /><Text style={styles.section}>Nothing here just yet.</Text><Text style={styles.copy}>Conversations shared by real Zorlii members will appear here.</Text></View> : null}
     </View>;
@@ -598,6 +669,13 @@ const styles = StyleSheet.create({
   buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "#14162c", borderWidth: 1, borderColor: "#3a3554", shadowOpacity: 0 }, secondaryText: { color: "#cdbaff" },
   post: { borderWidth: 1, borderColor: "#302d4d", borderRadius: 17, backgroundColor: "#11142a", padding: 16, marginVertical: 7, shadowColor: "#000", shadowOpacity: 0.22, shadowRadius: 14, shadowOffset: { width: 0, height: 7 }, elevation: 2 }, author: { color: "#f3f0ff", fontWeight: "700" },
   postAuthor: { flexDirection: "row", alignItems: "center", gap: 11, marginBottom: 10 },
+  postImage: { width: "100%", height: 280, backgroundColor: "#080a16", borderRadius: 13, marginVertical: 8 },
+  postVideo: { width: "100%", height: 240, backgroundColor: "#080a16", borderRadius: 13, marginVertical: 8 },
+  mediaSelection: { maxHeight: 92, marginVertical: 7 }, mediaSelectionContent: { gap: 8, paddingRight: 4 },
+  mediaSelectionItem: { width: 78, height: 78, borderRadius: 12, overflow: "hidden", backgroundColor: "#211a3a", alignItems: "center", justifyContent: "center" },
+  mediaSelectionImage: { width: "100%", height: "100%" }, mediaSelectionText: { color: "#e8e1ff", fontSize: 12, fontWeight: "700" },
+  mediaRemove: { position: "absolute", top: 3, right: 3, width: 22, height: 22, borderRadius: 11, backgroundColor: "#17122b", alignItems: "center", justifyContent: "center" },
+  mediaRemoveText: { color: "#fff", fontSize: 18, lineHeight: 21, fontWeight: "700" },
   avatarHalo: { alignItems: "center", justifyContent: "center", position: "relative", backgroundColor: "#17152d", borderWidth: 2, borderColor: "#a27cff", shadowColor: "#9868ff", shadowOpacity: 0.48, shadowRadius: 10, shadowOffset: { width: 0, height: 3 }, elevation: 3 },
   avatar: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#21183d", borderWidth: 2, borderColor: "#101225" },
   avatarPulse: { position: "absolute", top: 2, right: 2, width: 8, height: 8, borderRadius: 4, borderWidth: 1, borderColor: "#e5f8ff", backgroundColor: "#74d7ff", shadowColor: "#68d6ff", shadowOpacity: 0.9, shadowRadius: 7, elevation: 4 },

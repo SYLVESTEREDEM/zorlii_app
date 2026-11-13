@@ -97,6 +97,15 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS posts_created ON posts(id DESC);
                 CREATE INDEX IF NOT EXISTS posts_user ON posts(user_id, id DESC);
+                CREATE TABLE IF NOT EXISTS post_media (
+                    id INTEGER PRIMARY KEY,
+                    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL UNIQUE,
+                    media_type TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS post_media_post ON post_media(post_id, position, id);
                 CREATE TABLE IF NOT EXISTS replies (
                     id INTEGER PRIMARY KEY,
                     post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,

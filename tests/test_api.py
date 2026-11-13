@@ -41,6 +41,7 @@ class SMTPAuthFailingMailer:
 class AccountApiTests(unittest.TestCase):
     def setUp(self):
         self.avatar_dir = Path(__file__).with_name(f".avatar-test-storage-{id(self)}")
+        self.media_dir = Path(__file__).with_name(f".media-test-storage-{id(self)}")
         self.secret_patch = mock.patch.dict(os.environ, {
             "ZORLII_OTP_SECRET": "test-secret-" + "x" * 40,
             "ZORLII_SMTP_HOST": "smtp.example.test",
@@ -49,11 +50,12 @@ class AccountApiTests(unittest.TestCase):
         self.secret_patch.start()
         self.db = Database(":memory:")
         self.mailer = CapturingMailer()
-        self.client = TestClient(new_app(self.db, self.mailer, self.avatar_dir))
+        self.client = TestClient(new_app(self.db, self.mailer, self.avatar_dir, self.media_dir))
 
     def tearDown(self):
         self.secret_patch.stop()
         shutil.rmtree(self.avatar_dir, ignore_errors=True)
+        shutil.rmtree(self.media_dir, ignore_errors=True)
 
     @staticmethod
     def image_bytes(image_format="PNG"):
@@ -490,10 +492,10 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.put(
             "/api/profile/avatar", content=png, headers={"Content-Type": "image/png"},
         ).status_code, 401)
-        unsupported = self.client.put(
+        invalid_gif = self.client.put(
             "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/gif"}, content=b"gif",
         )
-        self.assertEqual(unsupported.status_code, 415)
+        self.assertEqual(invalid_gif.status_code, 400)
         spoofed = self.client.put(
             "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/jpeg"}, content=png,
         )
@@ -502,14 +504,17 @@ class AccountApiTests(unittest.TestCase):
             "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"}, content=b"not an image",
         )
         self.assertEqual(corrupt.status_code, 400)
-        oversized = self.client.put(
-            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"},
-            content=b"x" * (2 * 1024 * 1024 + 1),
-        )
+        with mock.patch("zorlii_app.main.AVATAR_MAX_BYTES", 8):
+            oversized = self.client.put(
+                "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"},
+                content=b"x" * 9,
+            )
         self.assertEqual(oversized.status_code, 413)
 
         uploaded = self.client.put(
-            "/api/profile/avatar", headers={**alice_headers, "Content-Type": "image/png"}, content=png,
+            "/api/profile/avatar",
+            headers=alice_headers,
+            files={"file": ("profile.gif", self.image_bytes("GIF"), "image/gif")},
         )
         self.assertEqual(uploaded.status_code, 200, uploaded.text)
         avatar_url = uploaded.json()["avatar_url"]
@@ -551,6 +556,84 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/avatars/{alice['user']['id']}").status_code, 404)
         self.assertEqual(list(self.avatar_dir.glob("*.jpg")), [])
 
+    def test_profile_photo_accepts_images_above_old_limit_without_client_error(self):
+        alice = self.register()
+        headers = self.auth(alice["token"])
+        pixels = os.urandom(1024 * 1024 * 3)
+        output = io.BytesIO()
+        Image.frombytes("RGB", (1024, 1024), pixels).save(output, format="PNG")
+        image = output.getvalue()
+        self.assertGreater(len(image), 2 * 1024 * 1024)
+        uploaded = self.client.put(
+            "/api/profile/avatar", headers={**headers, "Content-Type": "image/png"}, content=image,
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+
+    def test_post_media_upload_supports_gif_video_visibility_and_cleanup(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        alice_headers = self.auth(alice["token"])
+        bob_headers = self.auth(bob["token"])
+        gif = self.image_bytes("GIF")
+        private_post = self.client.post(
+            "/api/posts/media",
+            headers=alice_headers,
+            data={"body": "", "visibility": "private"},
+            files=[("media", ("loop.gif", gif, "image/gif"))],
+        )
+        self.assertEqual(private_post.status_code, 201, private_post.text)
+        post = private_post.json()["post"]
+        self.assertEqual(post["body"], "")
+        self.assertEqual(post["media"][0]["media_type"], "image/gif")
+        gif_response = self.client.get(post["media"][0]["url"], headers=alice_headers)
+        self.assertEqual(gif_response.status_code, 200)
+        self.assertEqual(gif_response.headers["content-type"], "image/gif")
+        with Image.open(io.BytesIO(gif_response.content)) as decoded:
+            self.assertEqual(decoded.format, "GIF")
+        self.assertEqual(
+            self.client.get(post["media"][0]["url"], headers=bob_headers).status_code, 404,
+        )
+
+        mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
+        video_post = self.client.post(
+            "/api/posts/media",
+            headers=alice_headers,
+            data={"body": "A short clip", "visibility": "public"},
+            files=[("media", ("clip.mp4", mp4, "video/mp4"))],
+        )
+        self.assertEqual(video_post.status_code, 201, video_post.text)
+        video = video_post.json()["post"]["media"][0]
+        self.assertEqual(video["media_type"], "video/mp4")
+        fetched_video = self.client.get(video["url"], headers=bob_headers)
+        self.assertEqual(fetched_video.status_code, 200)
+        self.assertEqual(fetched_video.content, mp4)
+        self.assertEqual(fetched_video.headers["x-content-type-options"], "nosniff")
+
+        stored = list(self.media_dir.iterdir())
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(self.client.delete(
+            f"/api/posts/{video_post.json()['post']['id']}", headers=bob_headers,
+        ).status_code, 404)
+        self.assertTrue(all(path.exists() for path in stored))
+        self.assertEqual(self.client.delete(
+            f"/api/posts/{video_post.json()['post']['id']}", headers=alice_headers,
+        ).status_code, 200)
+        self.assertEqual(len(list(self.media_dir.iterdir())), 1)
+
+    def test_post_media_rejects_bad_content_and_requires_text_or_media(self):
+        alice = self.register()
+        headers = self.auth(alice["token"])
+        invalid = self.client.post(
+            "/api/posts/media",
+            headers=headers,
+            data={"body": "Invalid upload"},
+            files=[("media", ("fake.gif", b"not a GIF", "image/gif"))],
+        )
+        self.assertEqual(invalid.status_code, 415)
+        empty = self.client.post("/api/posts/media", headers=headers, data={"body": ""})
+        self.assertEqual(empty.status_code, 422)
+        self.assertEqual(list(self.media_dir.iterdir()), [])
+
     def test_account_deletion_removes_profile_photo(self):
         alice = self.register()
         headers = self.auth(alice["token"])
@@ -561,12 +644,21 @@ class AccountApiTests(unittest.TestCase):
         )
         self.assertEqual(uploaded.status_code, 200, uploaded.text)
         path = next(self.avatar_dir.glob("*.jpg"))
+        post = self.client.post(
+            "/api/posts/media",
+            headers=headers,
+            data={"body": ""},
+            files=[("media", ("loop.gif", self.image_bytes("GIF"), "image/gif"))],
+        )
+        self.assertEqual(post.status_code, 201, post.text)
+        media_path = next(self.media_dir.iterdir())
         response = self.client.request(
             "DELETE", "/api/account", headers=headers,
             json={"password": "Correct horse battery staple 4!"},
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(path.exists())
+        self.assertFalse(media_path.exists())
 
     def test_account_export_contains_user_data_but_never_credentials(self):
         alice = self.register()
