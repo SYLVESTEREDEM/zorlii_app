@@ -1,5 +1,7 @@
+import json
 import os
 import smtplib
+import urllib.request
 from email.message import EmailMessage
 
 
@@ -59,3 +61,58 @@ class SMTPMailer:
             if self.username:
                 smtp.login(self.username, self.password)
             smtp.send_message(message)
+
+
+def _otp_content(code, purpose):
+    if purpose == "register":
+        subject = "Verify your Zorlii email"
+        action = "verify your email address and finish creating your account"
+    else:
+        subject = "Your Zorlii password reset code"
+        action = "confirm your email address and reset your password"
+    body = (
+        f"Use this one-time code to {action}:\n\n"
+        f"{code}\n\n"
+        "The code expires in 10 minutes. If you did not request it, you can ignore this message."
+    )
+    return subject, body
+
+
+class ResendMailer:
+    """Sends OTP email over HTTPS (port 443), which works where outbound SMTP is blocked."""
+
+    API_URL = "https://api.resend.com/emails"
+
+    def __init__(self, api_key, sender):
+        self.api_key = api_key
+        self.sender = sender
+
+    @classmethod
+    def from_env(cls):
+        api_key = os.environ.get("ZORLII_RESEND_API_KEY", "").strip()
+        sender = (os.environ.get("ZORLII_EMAIL_FROM") or os.environ.get("ZORLII_SMTP_FROM", "")).strip()
+        if not api_key or not sender:
+            raise SMTPConfigurationError("Resend is not configured.")
+        return cls(api_key, sender)
+
+    def send_otp(self, recipient, code, purpose):
+        subject, body = _otp_content(code, purpose)
+        request = urllib.request.Request(
+            self.API_URL,
+            data=json.dumps({"from": self.sender, "to": [recipient], "subject": subject, "text": body}).encode(),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "zorlii-app/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=15):
+            pass
+
+
+def mailer_from_env():
+    """Prefer the HTTPS provider when its key is set; otherwise fall back to SMTP."""
+    if os.environ.get("ZORLII_RESEND_API_KEY", "").strip():
+        return ResendMailer.from_env()
+    return SMTPMailer.from_env()

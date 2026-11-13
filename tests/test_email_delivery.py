@@ -45,3 +45,17 @@ class SMTPMailerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResendMailerTests(unittest.TestCase):
+    def test_prefers_resend_and_posts_code(self):
+        from zorlii_app.email_delivery import ResendMailer, mailer_from_env
+        env = {"ZORLII_RESEND_API_KEY": "re_x", "ZORLII_EMAIL_FROM": "Zorlii <a@b.test>"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            mailer = mailer_from_env()
+        self.assertIsInstance(mailer, ResendMailer)
+        with mock.patch("zorlii_app.email_delivery.urllib.request.urlopen") as urlopen:
+            mailer.send_otp("m@example.test", "123456", "register")
+        req = urlopen.call_args.args[0]
+        self.assertEqual(req.get_header("Authorization"), "Bearer re_x")
+        self.assertIn(b"123456", req.data)
