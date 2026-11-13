@@ -137,6 +137,7 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("VideoView", mobile)
         self.assertIn(".notification-item p{margin:5px 0 10px;color:#000}", html)
         self.assertIn("background:#fff!important;color:#000!important", html)
+        self.assertIn("-webkit-text-fill-color:#000!important;caret-color:#000", html)
         self.assertNotIn("Profile photos must be 2 MB", html)
         self.assertNotIn("2 MB", mobile)
 
