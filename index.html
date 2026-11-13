@@ -69,7 +69,8 @@
       const button = document.querySelector('nav[aria-label="Main navigation"] [data-go="notifications"]');
       if (!button) return;
       button.classList.toggle("active", screen === "notifications");
-      button.innerHTML = `Notifications${notificationUnreadCount ? `<span class="count-badge" aria-label="${notificationUnreadCount} unread">${notificationUnreadCount}</span>` : ""}`;
+      const content = `Notifications${notificationUnreadCount ? `<span class="count-badge" aria-label="${notificationUnreadCount} unread">${notificationUnreadCount}</span>` : ""}`;
+      if (button.innerHTML !== content) button.innerHTML = content;
     }
 
     function notificationDescription(item) {
