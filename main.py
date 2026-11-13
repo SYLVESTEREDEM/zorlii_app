@@ -425,11 +425,16 @@ def new_app(database=None, mailer=None):
             provider_reason = getattr(error, "provider_reason", "unavailable")
             if not isinstance(provider_reason, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", provider_reason):
                 provider_reason = "unavailable"
+            provider_content_type = getattr(error, "provider_content_type", "unavailable")
+            if provider_content_type not in {"json", "html", "text", "other", "unavailable"}:
+                provider_content_type = "unavailable"
             LOGGER.error(
-                "One-time email delivery failed (error_type=%s, provider_code=%s, provider_reason=%s).",
+                "One-time email delivery failed (error_type=%s, provider_code=%s, "
+                "provider_reason=%s, provider_content_type=%s).",
                 type(error).__name__,
                 provider_code,
                 provider_reason,
+                provider_content_type,
             )
             raise HTTPException(status_code=503, detail="The code could not be delivered. Please try again later.")
         return {"message": OTP_GENERIC_MESSAGE}

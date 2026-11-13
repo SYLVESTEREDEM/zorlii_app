@@ -64,6 +64,8 @@ class ResendMailerTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.resend.com/emails")
         self.assertEqual(request.get_header("Authorization"), "Bearer re_test_key")
+        self.assertEqual(request.get_header("User-agent"), "Zorlii/1.0")
+        self.assertEqual(request.get_header("Accept"), "application/json")
         payload = json.loads(request.data)
         self.assertEqual(payload["to"], ["member@example.test"])
         self.assertIn("password reset code", payload["subject"].lower())
@@ -84,6 +86,7 @@ class ResendMailerTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.code, 403)
         self.assertEqual(raised.exception.provider_reason, "sender_domain_unverified")
+        self.assertEqual(raised.exception.provider_content_type, "unavailable")
         self.assertNotIn("auth.example.test", str(raised.exception))
 
     def test_preserves_only_a_sanitized_resend_error_name(self):
@@ -99,6 +102,24 @@ class ResendMailerTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.provider_reason, "sender_policy_403")
         self.assertNotIn("Do not log", str(raised.exception))
+
+    def test_classifies_non_json_edge_rejections_without_logging_body(self):
+        body = b"<html><title>Attention Required | Cloudflare</title></html>"
+        error = HTTPError(
+            "https://api.resend.com/emails",
+            403,
+            "Forbidden",
+            {"Content-Type": "text/html; charset=utf-8"},
+            io.BytesIO(body),
+        )
+        with mock.patch("zorlii_app.email_delivery.urlopen", side_effect=error):
+            with self.assertRaises(ResendAPIError) as raised:
+                ResendMailer("re_test_key", "Zorlii <no-reply@auth.example.test>").send_otp(
+                    "member@example.test", "031947", "register"
+                )
+        self.assertEqual(raised.exception.provider_reason, "edge_firewall")
+        self.assertEqual(raised.exception.provider_content_type, "html")
+        self.assertNotIn("Cloudflare", str(raised.exception))
 
 
 if __name__ == "__main__":

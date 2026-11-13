@@ -15,16 +15,25 @@ class SMTPConfigurationError(EmailConfigurationError):
 
 
 class ResendAPIError(RuntimeError):
-    def __init__(self, status_code, reason):
+    def __init__(self, status_code, reason, content_type):
         super().__init__("Resend rejected the email request.")
         self.code = status_code
         self.provider_reason = reason
+        self.provider_content_type = content_type
 
 
 def _resend_error_reason(error):
+    raw_body = error.read()
     try:
-        body = json.loads(error.read().decode("utf-8"))
+        body = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
+        body_text = raw_body.decode("utf-8", errors="ignore").lower()
+        if any(marker in body_text for marker in ("cloudflare", "cf-ray", "attention required")):
+            return "edge_firewall"
+        if "access denied" in body_text:
+            return "access_denied"
+        if "forbidden" in body_text:
+            return "forbidden_response"
         return "non_json_response"
     if not isinstance(body, dict):
         return "unstructured_json_response"
@@ -54,6 +63,18 @@ def _resend_error_reason(error):
     ):
         return name.lower()
     return "unavailable"
+
+
+def _resend_content_type(error):
+    header = error.headers.get("Content-Type", "") if error.headers else ""
+    media_type = header.split(";", 1)[0].strip().lower()
+    if media_type in {"application/json", "application/problem+json"} or media_type.endswith("+json"):
+        return "json"
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        return "html"
+    if media_type.startswith("text/"):
+        return "text"
+    return "other" if media_type else "unavailable"
 
 
 def otp_email_content(code, purpose):
@@ -145,6 +166,8 @@ class ResendMailer:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Zorlii/1.0",
             },
             method="POST",
         )
@@ -152,7 +175,11 @@ class ResendMailer:
             with urlopen(request, timeout=15):
                 pass
         except HTTPError as error:
-            raise ResendAPIError(error.code, _resend_error_reason(error)) from None
+            raise ResendAPIError(
+                error.code,
+                _resend_error_reason(error),
+                _resend_content_type(error),
+            ) from None
 
 
 def mailer_from_env():
