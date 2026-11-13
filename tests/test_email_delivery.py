@@ -64,6 +64,7 @@ class ResendMailerTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.resend.com/emails")
         self.assertEqual(request.get_header("Authorization"), "Bearer re_test_key")
+        self.assertTrue(request.get_header("User-agent").startswith("zorlii-app/"))
         payload = json.loads(request.data)
         self.assertEqual(payload["to"], ["member@example.test"])
         self.assertIn("password reset code", payload["subject"].lower())
