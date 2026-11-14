@@ -536,6 +536,161 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.patch(f"/api/conversations/{conv}/messages/{message_id}", headers=hb, json={"body": "changed"}).status_code, 404)
         self.assertEqual(self.client.patch(f"/api/conversations/{conv}/messages/{message_id}", headers=ha, json={"body": "Updated hello"}).status_code, 200)
 
+    def test_profile_activity_counts_and_post_pagination(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        self.assertEqual(self.client.get("/api/me", headers=ha).json()["user"]["activity_counts"],
+                         {"posts": 0, "media": 0, "replies": 0, "likes": 0, "echoes": 0,
+                          "saved": 0, "messages": 0})
+        root = self.client.post("/api/posts", headers=hb, json={"body": "Bob's post"}).json()["post"]
+        photo = self.client.post(
+            "/api/posts/media", headers=ha, data={"body": "My photo"},
+            files=[("media", ("post.png", self.image_bytes(), "image/png"))],
+        ).json()["post"]
+        self.client.post("/api/posts", headers=ha, json={"body": "Private", "visibility": "private"})
+        reply = self.client.post(
+            f"/api/posts/{root['id']}/replies/media", headers=ha, data={"body": "My reply"},
+            files=[("media", ("reply.png", self.image_bytes(), "image/png"))],
+        ).json()
+        self.client.post(f"/api/posts/{root['id']}/reaction", headers=ha)
+        self.client.post(f"/api/replies/{reply['id']}/reaction", headers=ha)
+        self.client.post(f"/api/posts/{root['id']}/bookmark", headers=ha)
+        self.client.post(f"/api/posts/{root['id']}/repost", headers=ha)
+        self.client.post(f"/api/replies/{reply['id']}/repost", headers=ha)
+        conversation_id = self.client.post(
+            "/api/conversations", headers=ha, json={"username": "bob"},
+        ).json()["id"]
+        self.client.post(
+            f"/api/conversations/{conversation_id}/messages", headers=ha, json={"body": "Hello"},
+        )
+        counts = self.client.get("/api/me", headers=ha).json()["user"]["activity_counts"]
+        self.assertEqual(counts, {"posts": 3, "media": 2, "replies": 1, "likes": 2, "echoes": 2,
+                                  "saved": 1, "messages": 1})
+        url = "/api/users/jamie/posts"
+        latest = self.client.get(url, headers=hb, params={"limit": 1}).json()
+        self.assertTrue(latest["has_more"])
+        older = self.client.get(
+            url, headers=hb, params={"limit": 1, "before_id": latest["posts"][0]["id"]},
+        ).json()
+        self.assertFalse(older["has_more"])
+        self.assertEqual([post["id"] for post in older["posts"]], [photo["id"]])
+        self.assertEqual(self.client.get(url, headers=hb, params={"before_id": 0}).status_code, 422)
+
+    def test_mentions_notify_once_only_when_recipient_can_see_content(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        eve = self.register("eve@example.test", "eve", "Eve")
+        ha, hb, he = self.auth(alice["token"]), self.auth(bob["token"]), self.auth(eve["token"])
+        post = self.client.post(
+            "/api/posts", headers=ha,
+            json={"body": "Hello @Bob and @bob, contact someone@eve.example or @unknown"},
+        ).json()["post"]
+        mentions = [item for item in self.client.get("/api/notifications", headers=hb).json()["notifications"]
+                    if item["kind"] == "mention"]
+        self.assertEqual(len(mentions), 1)
+        self.assertEqual(mentions[0]["post_id"], post["id"])
+        self.assertEqual(self.client.get("/api/notifications", headers=he).json()["notifications"], [])
+        self.client.post("/api/posts", headers=ha, json={"body": "@bob", "visibility": "private"})
+        self.client.post("/api/posts", headers=ha, json={"body": "@bob", "visibility": "followers"})
+        self.assertEqual(len([item for item in self.client.get("/api/notifications", headers=hb).json()["notifications"]
+                              if item["kind"] == "mention"]), 1)
+        self.client.post("/api/users/jamie/follow", headers=hb)
+        self.client.post("/api/posts", headers=ha, json={"body": "@bob", "visibility": "followers"})
+        self.assertEqual(len([item for item in self.client.get("/api/notifications", headers=hb).json()["notifications"]
+                              if item["kind"] == "mention"]), 2)
+        self.client.post("/api/users/jamie/block", headers=he)
+        self.client.post("/api/posts", headers=ha, json={"body": "@eve"})
+        self.assertEqual(self.client.get("/api/notifications", headers=he).json()["notifications"], [])
+
+    def test_mentions_in_media_posts_and_replies(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        post_response = self.client.post(
+            "/api/posts/media", headers=ha, data={"body": "@bob"},
+            files=[("media", ("photo.png", self.image_bytes(), "image/png"))],
+        )
+        self.assertEqual(post_response.status_code, 201, post_response.text)
+        post_id = post_response.json()["post"]["id"]
+        reply_response = self.client.post(
+            f"/api/posts/{post_id}/replies/media", headers=ha, data={"body": "@bob"},
+            files=[("media", ("photo.png", self.image_bytes(), "image/png"))],
+        )
+        self.assertEqual(reply_response.status_code, 201, reply_response.text)
+        text_reply = self.client.post(
+            f"/api/posts/{post_id}/replies", headers=ha, json={"body": "@bob"},
+        )
+        self.assertEqual(text_reply.status_code, 201, text_reply.text)
+        mentions = [item for item in self.client.get("/api/notifications", headers=hb).json()["notifications"]
+                    if item["kind"] == "mention"]
+        self.assertEqual({item["reply_id"] for item in mentions},
+                         {None, reply_response.json()["id"], text_reply.json()["id"]})
+        self.assertTrue(all(item["post_id"] == post_id for item in mentions))
+
+    def test_mention_push_is_only_sent_for_visible_content(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        token = "ExpoPushToken[0123456789abcdef01234567]"
+        self.assertEqual(self.client.post(
+            "/api/push-token", headers=hb, json={"token": token, "platform": "android"},
+        ).status_code, 204)
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"data":[{"status":"ok"}]}'
+        with mock.patch("zorlii_app.main.urlopen", return_value=response) as push_request:
+            self.client.post("/api/posts", headers=ha, json={"body": "@bob", "visibility": "private"})
+            push_request.assert_not_called()
+            post = self.client.post("/api/posts", headers=ha, json={"body": "@bob"}).json()["post"]
+        payload = json.loads(push_request.call_args.args[0].data)
+        self.assertEqual(payload[0]["to"], token)
+        self.assertEqual(payload[0]["data"]["post_id"], post["id"])
+        self.assertEqual(payload[0]["title"], "New mention")
+
+    def test_message_history_pagination_and_conversation_date(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        outsider = self.register("eve@example.test", "eve", "Eve")
+        ha, hb, he = self.auth(alice["token"]), self.auth(bob["token"]), self.auth(outsider["token"])
+        conversation_id = self.client.post(
+            "/api/conversations", headers=ha, json={"username": "bob"},
+        ).json()["id"]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE conversations SET created_at=? WHERE id=?",
+                ("2024-01-02 10:00:00", conversation_id),
+            )
+        url = f"/api/conversations/{conversation_id}/messages"
+        empty = self.client.get(url, headers=hb).json()
+        self.assertEqual(empty["conversation_created_at"], "2024-01-02 10:00:00")
+        self.assertEqual(empty["messages"], [])
+        self.assertFalse(empty["has_more"])
+        for number in range(5):
+            self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                headers=ha, json={"body": f"Message {number}"},
+            )
+        self.assertEqual(
+            self.client.get("/api/conversations", headers=hb).json()["conversations"][0]["created_at"],
+            "2024-01-02 10:00:00",
+        )
+        latest = self.client.get(url, headers=hb, params={"limit": 2}).json()
+        self.assertEqual(latest["conversation_created_at"], "2024-01-02 10:00:00")
+        self.assertTrue(latest["has_more"])
+        self.assertEqual([message["body"] for message in latest["messages"]], ["Message 3", "Message 4"])
+        older = self.client.get(
+            url, headers=hb, params={"limit": 2, "before_id": latest["messages"][0]["id"]},
+        ).json()
+        self.assertTrue(older["has_more"])
+        self.assertEqual([message["body"] for message in older["messages"]], ["Message 1", "Message 2"])
+        oldest = self.client.get(
+            url, headers=hb, params={"limit": 2, "before_id": older["messages"][0]["id"]},
+        ).json()
+        self.assertFalse(oldest["has_more"])
+        self.assertEqual([message["body"] for message in oldest["messages"]], ["Message 0"])
+        self.assertEqual(self.client.get(url, headers=he, params={"before_id": 1}).status_code, 404)
+        self.assertEqual(self.client.get(url, headers=hb, params={"before_id": 0}).status_code, 422)
+
     def test_legacy_member_must_accept_terms_before_contributing(self):
         with self.db.transaction() as connection:
             cursor = connection.execute(

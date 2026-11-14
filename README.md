@@ -42,6 +42,10 @@ Set that value as `ZORLII_OTP_SECRET`. For Railway Free, Trial, or Hobby plans, 
 
 The Expo source is in `zorlii_app\mobile`. It stores bearer sessions with Expo SecureStore and supports email-verified sign-up, OTP password recovery, sign-in, Pulse, posts and replies with photos/videos, likes, reposts, quotes, bookmarks, search, follow, follower/following lists, Activities, private conversations, profile-photo selection/change/removal, profile/consent settings, content and account reports, blocking/unblocking, moderator report review, and local extractive assistance. Foreground views refresh automatically; phone push delivery uses Expo Push Service.
 
+Conversation history is returned newest-page-first, with messages ordered chronologically within each page. The messages endpoint accepts `before_id` for older pages and returns `has_more` and `conversation_created_at`; access remains restricted to conversation participants.
+Mentions in posts and replies create an Activity and schedule a push for each tagged account that can view the content; blocked accounts and private or otherwise inaccessible content do not receive mention alerts.
+The signed-in profile exposes activity totals for posts, attachments, replies, likes, echoes, saved posts and sent messages. Profile posts use `before_id` pagination and continue to respect the viewer's access to each post.
+
 Use Node.js 22.13 or newer for the current Expo SDK. An Android APK can be built locally with the Android SDK installed, or through EAS Build. The project includes `eas.json` profiles for an internal-test APK and a production Android App Bundle.
 
 1. Start the backend as above. Find the computer's private Wi-Fi IPv4 address (for example with `ipconfig`).

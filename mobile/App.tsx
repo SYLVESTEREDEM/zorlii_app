@@ -9,6 +9,7 @@ import * as Notifications from "expo-notifications";
 import Constants from "expo-constants";
 import * as Device from "expo-device";
 import { VideoView, useVideoPlayer } from "expo-video";
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
@@ -20,26 +21,37 @@ Notifications.setNotificationHandler({
     shouldSetBadge: false,
   }),
 });
-type User = { id: number; username: string; email: string; display_name: string; bio: string; avatar_url: string | null; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean; terms_accepted: boolean; is_moderator: boolean };
+type ActivityCounts = { posts: number; media: number; replies: number; likes: number; echoes: number; saved: number; messages: number };
+type User = { id: number; username: string; email: string; display_name: string; bio: string; avatar_url: string | null; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean; terms_accepted: boolean; is_moderator: boolean; activity_counts?: ActivityCounts };
 type ReportTarget = { target_type: "post" | "user"; target_id: number; label: string };
 type ModerationReport = { id: number; target_type: "post" | "user"; post_id: number | null; target_user_id: number | null; target_username: string | null; reporter_username: string; reason: string; details: string; status: string; created_at: string; post_body: string | null };
 type PostMedia = { id: number; url: string; media_type: string };
 type Author = { id: number; username: string; display_name: string; avatar_url?: string | null };
 type Reply = { id: number; body: string; created_at?: string; reaction_count: number; repost_count: number; reacted: boolean; reposted: boolean; media?: PostMedia[]; quoted_post?: Post | null; quoted_reply?: Reply | null; author: Author };
 type Post = { id: number; body: string; created_at: string; reaction_count: number; repost_count: number; reply_count: number; reacted: boolean; reposted: boolean; bookmarked: boolean; reposted_by?: Author | null; quoted_post?: Post | null; quoted_reply?: Reply | null; media?: PostMedia[]; author: Author };
-type Conversation = { id: number; last_message?: string; participants: { id: number; username: string; display_name: string; avatar_url?: string | null }[] };
+type Conversation = { id: number; created_at?: string; last_message?: string; participants: { id: number; username: string; display_name: string; avatar_url?: string | null }[] };
+type DirectMessage = { id: number; body: string; created_at: string; sender_id: number; author: Author };
+type PublicProfile = Author & { bio: string; following: boolean; follower_count: number; following_count: number };
 type Member = { id: number; username: string; display_name: string; bio: string; avatar_url?: string | null };
-type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction" | "repost" | "quote" | "message" | "reply_reaction" | "reply_repost"; post_id: number | null; created_at: string; read: boolean; actor: Author };
+type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction" | "repost" | "quote" | "message" | "reply_reaction" | "reply_repost" | "mention"; post_id: number | null; reply_id?: number | null; created_at: string; read: boolean; actor: Author };
 type QuoteTarget = { type: "post" | "reply"; item: Post | Reply };
 type NativeFilePart = { uri: string; name: string; type: string };
 type NativeUploadFormData = FormData & { append(name: string, value: string | NativeFilePart): void };
 
-function PostVideo({ uri, token }: { uri: string; token: string }) {
+function PostVideo({ uri, token, style = styles.postVideo }: { uri: string; token: string; style?: any }) {
   const player = useVideoPlayer(
     { uri, headers: { Authorization: `Bearer ${token}` } },
     instance => { instance.loop = false; },
   );
-  return <VideoView style={styles.postVideo} player={player} nativeControls contentFit="contain" />;
+  return <VideoView style={style} player={player} nativeControls contentFit="contain" />;
+}
+
+function MediaPickerButton({ label, onPress }: { label: string; onPress: () => void }) {
+  return <Pressable accessibilityRole="button" accessibilityLabel={label}
+    accessibilityHint="Choose photos, videos, or GIFs to attach."
+    onPress={onPress} style={({ pressed }) => [styles.mediaPickerButton, pressed && styles.buttonPressed]}>
+    <Text style={styles.mediaPickerIcon} accessibilityElementsHidden>+</Text>
+  </Pressable>;
 }
 
 function passwordPolicyError(password: string) {
@@ -61,8 +73,36 @@ function activityDescription(kind: NotificationItem["kind"]) {
     message: "sent you a message.",
     reply_reaction: "liked your reply.",
     reply_repost: "echoed your reply.",
+    mention: "mentioned you.",
   };
   return descriptions[kind] || "shared an update with you.";
+}
+
+function mergeMessages(current: DirectMessage[], incoming: DirectMessage[]) {
+  const byId = new Map<number, DirectMessage>();
+  [...current, ...incoming].forEach(message => byId.set(message.id, message));
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+function mergeProfilePosts(current: Post[], incoming: Post[]) {
+  const byId = new Map<number, Post>();
+  [...current, ...incoming].forEach(post => byId.set(post.id, post));
+  return [...byId.values()].sort((a, b) => b.id - a.id);
+}
+
+function parsedDate(value: string) {
+  const normalized = value.includes("T") ? value : value.includes(" ") ? value.replace(" ", "T") : `${value}T00:00:00`;
+  return new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+}
+
+function formatMessageTime(value: string) {
+  const date = parsedDate(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+function formatConversationDate(value: string) {
+  const date = parsedDate(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString(undefined, { dateStyle: "long" });
 }
 
 function BrandHalo({ size = 48, showLogo = false, quiet = false }: { size?: number; showLogo?: boolean; quiet?: boolean }) {
@@ -79,12 +119,17 @@ function BrandHalo({ size = 48, showLogo = false, quiet = false }: { size?: numb
   </View>;
 }
 
-function Avatar({ user, size = 42 }: { user?: { display_name?: string; username?: string; avatar_url?: string | null } | null; size?: number }) {
+function Avatar({ user, size = 42, onPress }: {
+  user?: { display_name?: string; username?: string; avatar_url?: string | null } | null;
+  size?: number;
+  onPress?: () => void;
+}) {
   const [imageFailed, setImageFailed] = useState(false);
   const name = user?.display_name || user?.username || "Zorlii member";
   const initials = name.trim().split(/\s+/).slice(0, 2).map(part => part[0] || "").join("").toUpperCase() || "Z";
   useEffect(() => { setImageFailed(false); }, [user?.avatar_url]);
-  return <View accessible accessibilityRole="image" accessibilityLabel={user?.avatar_url && !imageFailed ? `${name} profile photo` : `${initials} initials`}
+  const contents = <View accessible={!onPress} accessibilityRole={onPress ? undefined : "image"}
+    accessibilityLabel={user?.avatar_url && !imageFailed ? `${name} profile photo` : `${initials} initials`}
     style={[styles.avatarHalo, { width: size + 10, height: size + 10, borderRadius: (size + 10) / 2 }]}>
     <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2 }]}>
       {user?.avatar_url && !imageFailed
@@ -93,11 +138,27 @@ function Avatar({ user, size = 42 }: { user?: { display_name?: string; username?
     </View>
     <View style={styles.avatarPulse} />
   </View>;
+  return onPress
+    ? <Pressable accessibilityRole="button" accessibilityLabel={`View ${name}'s profile photo larger`} onPress={onPress}>{contents}</Pressable>
+    : contents;
 }
 
-export default function App() {
+function AppContent() {
+  const insets = useSafeAreaInsets();
   const composerRef = useRef<React.ElementRef<typeof TextInput> | null>(null);
   const pushTokenRef = useRef<string | null>(null);
+  const activeConversationIdRef = useRef<number | null>(null);
+  const messagesRef = useRef<DirectMessage[]>([]);
+  const messageScrollRef = useRef<React.ElementRef<typeof ScrollView> | null>(null);
+  const messageScrollYRef = useRef(0);
+  const messagePositionsRef = useRef(new Map<number, number>());
+  const messageRestoreOffsetRef = useRef<{ id: number; top: number; offset: number } | null>(null);
+  const messageLatestTargetRef = useRef<number | null>(null);
+  const profileReturnScreenRef = useRef("feed");
+  const publicProfileUsernameRef = useRef("");
+  const profileUserRef = useRef<number | null>(null);
+  const profileLoadedOlderRef = useRef(false);
+  const publicProfileLoadedOlderRef = useRef(false);
   const [token, setToken] = useState("");
   const [me, setMe] = useState<User | null>(null);
   const [screen, setScreen] = useState("login");
@@ -110,6 +171,9 @@ export default function App() {
   const [echoTarget, setEchoTarget] = useState<QuoteTarget | null>(null);
   const [focusedEchoOption, setFocusedEchoOption] = useState<"echo" | "thought" | "cancel" | null>(null);
   const [profilePosts, setProfilePosts] = useState<Post[]>([]);
+  const [profileHasMore, setProfileHasMore] = useState(false);
+  const [loadingProfileOlder, setLoadingProfileOlder] = useState(false);
+  const [activityCounts, setActivityCounts] = useState<ActivityCounts | null>(null);
   const [replies, setReplies] = useState<Record<number, any[]>>({});
   const [scope, setScope] = useState("all");
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -121,7 +185,17 @@ export default function App() {
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
   const [conversationId, setConversationId] = useState<number | null>(null);
-  const [messages, setMessages] = useState<any[]>([]);
+  const [messages, setMessages] = useState<DirectMessage[]>([]);
+  const [conversationCreatedAt, setConversationCreatedAt] = useState("");
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [selectedImage, setSelectedImage] = useState<{ uri: string; label: string } | null>(null);
+  const [publicProfile, setPublicProfile] = useState<PublicProfile | null>(null);
+  const [publicProfilePosts, setPublicProfilePosts] = useState<Post[]>([]);
+  const [publicProfileHasMore, setPublicProfileHasMore] = useState(false);
+  const [loadingPublicProfileOlder, setLoadingPublicProfileOlder] = useState(false);
+  const [profileSections, setProfileSections] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState<any>(null);
   const [inboxSearchResults, setInboxSearchResults] = useState<Member[]>([]);
   const [recommendations, setRecommendations] = useState<any[]>([]);
@@ -155,6 +229,82 @@ export default function App() {
   }
   function update(key: string, value: string) { setForm(current => ({ ...current, [key]: value })); setError(""); }
   function fail(e: unknown) { setError(e instanceof Error ? e.message : "Something went wrong."); }
+  function showImage(uri: string, label: string) {
+    setSelectedImage({ uri, label });
+  }
+  async function openPublicProfile(username: string) {
+    if (username.toLowerCase() === me?.username.toLowerCase()) {
+      loadProfile();
+      return;
+    }
+    profileReturnScreenRef.current = screen.startsWith("social-") ? profileReturnScreenRef.current : screen;
+    const sameProfile = publicProfileUsernameRef.current === username.toLowerCase();
+    publicProfileUsernameRef.current = username.toLowerCase();
+    setPublicProfile(null);
+    if (!sameProfile) {
+      publicProfileLoadedOlderRef.current = false;
+      setPublicProfilePosts([]);
+      setPublicProfileHasMore(false);
+    }
+    setScreen("social-profile");
+    setLoading(true);
+    try {
+      const [profileData, postData] = await Promise.all([
+        request(`/api/users/${encodeURIComponent(username)}`),
+        request(`/api/users/${encodeURIComponent(username)}/posts`),
+      ]);
+      if (publicProfileUsernameRef.current !== username.toLowerCase()) return;
+      setPublicProfile(profileData.user);
+      setPublicProfilePosts(current => sameProfile ? mergeProfilePosts(current, postData.posts) : postData.posts);
+      if (!publicProfileLoadedOlderRef.current) {
+        setPublicProfileHasMore(Boolean(postData.has_more));
+      }
+    } catch (e) { fail(e); }
+    finally { setLoading(false); }
+  }
+  async function loadOlderProfilePosts(isPublic: boolean) {
+    const username = isPublic ? publicProfile?.username : me?.username;
+    const currentPosts = isPublic ? publicProfilePosts : profilePosts;
+    const hasMore = isPublic ? publicProfileHasMore : profileHasMore;
+    const isLoading = isPublic ? loadingPublicProfileOlder : loadingProfileOlder;
+    if (!username || !hasMore || isLoading || !currentPosts.length) return;
+    const oldestId = Math.min(...currentPosts.map(post => post.id));
+    const userId = profileUserRef.current;
+    const setBusy = isPublic ? setLoadingPublicProfileOlder : setLoadingProfileOlder;
+    setBusy(true);
+    try {
+      const data = await request(`/api/users/${encodeURIComponent(username)}/posts?before_id=${oldestId}`);
+      if (profileUserRef.current !== userId) return;
+      if (isPublic) {
+        if (publicProfileUsernameRef.current !== username.toLowerCase()) return;
+        publicProfileLoadedOlderRef.current = true;
+        setPublicProfilePosts(current => mergeProfilePosts(current, data.posts));
+        setPublicProfileHasMore(Boolean(data.has_more));
+      } else {
+        profileLoadedOlderRef.current = true;
+        setProfilePosts(current => mergeProfilePosts(current, data.posts));
+        setProfileHasMore(Boolean(data.has_more));
+      }
+    } catch (e) { fail(e); }
+    finally { setBusy(false); }
+  }
+  function taggedText(body: string) {
+    const parts: React.ReactNode[] = [];
+    const mentionPattern = /(^|[^A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])/gi;
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = mentionPattern.exec(body)) !== null) {
+      const mentionStart = match.index + match[1].length;
+      if (mentionStart > cursor) parts.push(body.slice(cursor, mentionStart));
+      const username = match[2];
+      parts.push(<Text key={`${mentionStart}-${username}`} accessibilityRole="link"
+        accessibilityLabel={`View @${username}'s profile`} style={styles.mention}
+        onPress={() => { void openPublicProfile(username); }}>@{username}</Text>);
+      cursor = mentionPattern.lastIndex;
+    }
+    if (cursor < body.length) parts.push(body.slice(cursor));
+    return parts;
+  }
   async function registerPushToken(authToken: string) {
     if (!Device.isDevice || (Platform.OS !== "ios" && Platform.OS !== "android")) return false;
     if (pushTokenRef.current) return true;
@@ -196,13 +346,20 @@ export default function App() {
     setScreen("profile");
     if (!me) return;
     try {
-      const [postData, followerData, followingData, blockData] = await Promise.all([
+      const [postData, followerData, followingData, blockData, meData] = await Promise.all([
         request(`/api/users/${me.username}/posts`),
         request(`/api/users/${me.username}/followers`),
         request(`/api/users/${me.username}/following`),
         request("/api/blocks"),
+        request("/api/me"),
       ]);
-      setProfilePosts(postData.posts);
+      if (profileUserRef.current !== me.id) return;
+      setProfilePosts(current => mergeProfilePosts(current, postData.posts));
+      if (!profileLoadedOlderRef.current) {
+        setProfileHasMore(Boolean(postData.has_more));
+      }
+      setMe(meData.user);
+      setActivityCounts(meData.user.activity_counts || null);
       setFollowers(followerData.users);
       setFollowing(followingData.users);
       setBlockedUsers(blockData.users);
@@ -210,6 +367,21 @@ export default function App() {
       setFollowingCount(followingData.count);
     }
     catch (e) { fail(e); }
+  }
+  async function saveProfileSection(section: "profile" | "privacy") {
+    const body = section === "profile" ? {
+      display_name: form.display_name || me?.display_name,
+      bio: form.bio ?? me?.bio,
+      interests: (form.interests ?? me?.interests.join(",") ?? "").split(",").map(x => x.trim()).filter(Boolean),
+    } : {
+      recommendations_consent: form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent,
+      context_assistance_consent: form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent,
+    };
+    try {
+      const result = await request("/api/profile", "PATCH", body);
+      setMe(result.user);
+      Alert.alert("Saved", section === "profile" ? "Your profile has been updated." : "Your privacy choices have been updated.");
+    } catch (e) { fail(e); }
   }
   async function pickAvatar() {
     try {
@@ -271,6 +443,16 @@ export default function App() {
     } catch (e) { fail(e); }
     finally { setLoading(false); }
   }
+  async function openMentionTarget(item: NotificationItem) {
+    if (!item.post_id) return;
+    try {
+      const result = await request(`/api/posts/${item.post_id}`);
+      setPosts(current => [result.post, ...current.filter(post => post.id !== item.post_id)]);
+      if (item.reply_id) setReplies(current => ({ ...current, [item.post_id as number]: result.replies }));
+      setScope("all");
+      setScreen("feed");
+    } catch (e) { fail(e); }
+  }
   async function markNotificationRead(id: number) {
     try { await request(`/api/notifications/${id}/read`, "PATCH"); await loadNotifications(); }
     catch (e) { fail(e); }
@@ -290,9 +472,118 @@ export default function App() {
       update(`show-reply-${post.id}`, "1");
     } catch (e) { fail(e); }
   }
+  function scrollToLatestMessageWhenLaidOut(id: number | undefined) {
+    messageLatestTargetRef.current = id ?? null;
+    if (id !== undefined && messagePositionsRef.current.has(id)) {
+      requestAnimationFrame(() => {
+        if (messageLatestTargetRef.current !== id) return;
+        messageScrollRef.current?.scrollToEnd({ animated: false });
+        messageLatestTargetRef.current = null;
+      });
+    }
+  }
+  function onMessageLayout(id: number, top: number) {
+    messagePositionsRef.current.set(id, top);
+    const restore = messageRestoreOffsetRef.current;
+    if (restore?.id === id && top !== restore.top) {
+      const conversation = activeConversationIdRef.current;
+      messageRestoreOffsetRef.current = null;
+      requestAnimationFrame(() => {
+        if (activeConversationIdRef.current !== conversation) return;
+        messageScrollRef.current?.scrollTo({ y: Math.max(0, restore.offset + top - restore.top), animated: false });
+      });
+    } else if (messageLatestTargetRef.current === id) {
+      scrollToLatestMessageWhenLaidOut(id);
+    }
+  }
   async function loadConversation(id: number) {
-    try { setConversationId(id); setMessages((await request(`/api/conversations/${id}/messages`)).messages); setScreen("messages"); }
+    const isSameConversation = activeConversationIdRef.current === id;
+    activeConversationIdRef.current = id;
+    setConversationId(id);
+    setScreen("messages");
+    messagePositionsRef.current.clear();
+    messageRestoreOffsetRef.current = null;
+    messageLatestTargetRef.current = isSameConversation ? messagesRef.current[messagesRef.current.length - 1]?.id ?? null : null;
+    if (!isSameConversation) {
+      messagesRef.current = [];
+      setMessages([]);
+      setConversationCreatedAt(conversations.find(item => item.id === id)?.created_at || "");
+      setHasMoreMessages(false);
+      messageScrollYRef.current = 0;
+    }
+    setLoadingMessages(true);
+    try {
+      const data = await request(`/api/conversations/${id}/messages`);
+      if (activeConversationIdRef.current !== id) return;
+      const previousCount = messagesRef.current.length;
+      const nextMessages = isSameConversation ? mergeMessages(messagesRef.current, data.messages) : data.messages;
+      if (!isSameConversation || !previousCount) scrollToLatestMessageWhenLaidOut(nextMessages[nextMessages.length - 1]?.id);
+      messagesRef.current = nextMessages;
+      setMessages(nextMessages);
+      if (!isSameConversation || previousCount <= data.messages.length) {
+        setHasMoreMessages(Boolean(data.has_more));
+      }
+      setConversationCreatedAt(data.conversation_created_at || conversations.find(item => item.id === id)?.created_at || "");
+    }
     catch (e) { fail(e); }
+    finally { setLoadingMessages(false); }
+  }
+  async function refreshConversationMessages(id: number, scrollToLatest = false) {
+    const data = await request(`/api/conversations/${id}/messages`);
+    if (activeConversationIdRef.current !== id) return;
+    const previousCount = messagesRef.current.length;
+    const nextMessages = mergeMessages(messagesRef.current, data.messages);
+    if (scrollToLatest) scrollToLatestMessageWhenLaidOut(nextMessages[nextMessages.length - 1]?.id);
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    if (previousCount <= data.messages.length) {
+      setHasMoreMessages(Boolean(data.has_more));
+    }
+    if (data.conversation_created_at) setConversationCreatedAt(data.conversation_created_at);
+  }
+  async function loadOlderMessages() {
+    if (!hasMoreMessages || loadingOlderMessages || conversationId === null || messages.length === 0) return;
+    const id = conversationId;
+    const oldestId = messages[0].id;
+    setLoadingOlderMessages(true);
+    try {
+      const data = await request(`/api/conversations/${id}/messages?before_id=${oldestId}`);
+      if (activeConversationIdRef.current !== id) return;
+      const oldTop = messagePositionsRef.current.get(oldestId);
+      if (data.messages.length && oldTop !== undefined) {
+        messageLatestTargetRef.current = null;
+        messageRestoreOffsetRef.current = { id: oldestId, top: oldTop, offset: messageScrollYRef.current };
+      }
+      const nextMessages = mergeMessages(data.messages, messagesRef.current);
+      messagesRef.current = nextMessages;
+      setMessages(nextMessages);
+      setHasMoreMessages(Boolean(data.has_more));
+      if (data.conversation_created_at) setConversationCreatedAt(data.conversation_created_at);
+    } catch (e) { fail(e); }
+    finally { setLoadingOlderMessages(false); }
+  }
+  function resetConversationState() {
+    activeConversationIdRef.current = null;
+    messagesRef.current = [];
+    setConversationId(null);
+    setMessages([]);
+    setConversationCreatedAt("");
+    setHasMoreMessages(false);
+    setLoadingMessages(false);
+    setLoadingOlderMessages(false);
+    messageLatestTargetRef.current = null;
+    messagePositionsRef.current.clear();
+    messageRestoreOffsetRef.current = null;
+    publicProfileUsernameRef.current = "";
+    profileUserRef.current = null;
+    profileLoadedOlderRef.current = false;
+    publicProfileLoadedOlderRef.current = false;
+    setPublicProfile(null);
+    setPublicProfilePosts([]);
+    setPublicProfileHasMore(false);
+    setProfilePosts([]);
+    setProfileHasMore(false);
+    setActivityCounts(null);
   }
   async function acceptTerms() {
     try {
@@ -385,7 +676,9 @@ export default function App() {
       const response = await fetch(`${API_URL}/api/me`, { headers: { Authorization: `Bearer ${authToken}` } });
       if (!response.ok) throw new Error("Please sign in again.");
       const data = await response.json();
+      profileUserRef.current = data.user.id;
       setMe(data.user);
+      setActivityCounts(data.user.activity_counts || null);
       if (!data.user.terms_accepted) {
         setScreen("terms");
         return;
@@ -393,7 +686,7 @@ export default function App() {
       const feedResponse = await fetch(`${API_URL}/api/feed?scope=all`, { headers: { Authorization: `Bearer ${authToken}` } });
       if (feedResponse.ok) setPosts((await feedResponse.json()).posts);
       setScreen("feed");
-    } catch (e) { await SecureStore.deleteItemAsync("zorlii_session"); setToken(""); fail(e); }
+    } catch (e) { await SecureStore.deleteItemAsync("zorlii_session"); resetConversationState(); setToken(""); fail(e); }
   }
   useEffect(() => {
     (async () => {
@@ -467,7 +760,7 @@ export default function App() {
         } else if (screen === "inbox") {
           setConversations((await request("/api/conversations")).conversations);
         } else if (screen === "messages" && conversationId !== null) {
-          setMessages((await request(`/api/conversations/${conversationId}/messages`)).messages);
+          await refreshConversationMessages(conversationId);
         }
       } catch (e) { fail(e); }
     };
@@ -521,6 +814,7 @@ export default function App() {
     try { await request("/api/auth/logout", "POST"); }
     catch (e) { fail(e); }
     await SecureStore.deleteItemAsync("zorlii_session");
+    resetConversationState();
     setToken(""); setMe(null); setScreen("login"); setForm({}); setPostMedia([]);
   }
   async function exportAccount() {
@@ -547,6 +841,7 @@ export default function App() {
           try {
             await request("/api/account", "DELETE", { password: form.delete_password || "" });
             await SecureStore.deleteItemAsync("zorlii_session");
+            resetConversationState();
             setToken(""); setMe(null); setForm({}); setPostMedia([]); setScreen("login");
             setError("Your account and account-owned content have been deleted.");
           } catch (e) { fail(e); }
@@ -685,6 +980,18 @@ export default function App() {
       <Text style={[styles.buttonText, secondary && styles.secondaryText]}>{label}</Text>
     </Pressable>
   );
+  const disclosure = (key: string, label: string, content: React.ReactNode) => {
+    const expanded = Boolean(profileSections[key]);
+    return <View style={styles.disclosure}>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded }}
+        onPress={() => setProfileSections(current => ({ ...current, [key]: !current[key] }))}
+        style={styles.disclosureTrigger}>
+        <Text style={styles.disclosureTitle}>{label}</Text>
+        <Text style={styles.disclosureIcon} accessibilityElementsHidden>{expanded ? "−" : "+"}</Text>
+      </Pressable>
+      {expanded ? <View style={styles.disclosureContent}>{content}</View> : null}
+    </View>;
+  };
   const echoButton = (item: Post | Reply, type: "post" | "reply") => (
     <Pressable accessibilityRole="button"
       accessibilityLabel={`Echo options${item.repost_count ? `, ${item.repost_count} echoes` : ""}`}
@@ -697,6 +1004,12 @@ export default function App() {
       </Text>
     </Pressable>
   );
+  const profileLink = (username: string, label: string, textStyle: any = styles.author) => (
+    <Text accessibilityRole="link" accessibilityLabel={`View @${username}'s profile`}
+      onPress={() => { void openPublicProfile(username); }} style={[textStyle, styles.profileLink]}>{label}</Text>
+  );
+  const profilePhotoAction = (user?: { display_name?: string; username?: string; avatar_url?: string | null } | null) =>
+    user?.avatar_url ? () => showImage(`${API_URL}${user.avatar_url}`, `${user.display_name || user.username || "Member"} profile photo`) : undefined;
   const navItems = ["feed", "explore", "create", "inbox", "notifications", "profile"];
   const navLabels: Record<string, string> = {
     feed: "Pulse", explore: "Explore", create: "Create", inbox: "Inbox",
@@ -731,18 +1044,37 @@ export default function App() {
       </Pressable>;
     })}
   </View>;
-  const mediaContent = (media?: PostMedia[]) => media?.map(item => item.media_type.startsWith("video/")
-    ? <PostVideo key={item.id} uri={`${API_URL}${item.url}`} token={token} />
-    : <Image key={item.id} source={{ uri: `${API_URL}${item.url}`, headers: { Authorization: `Bearer ${token}` } }} style={styles.postImage} resizeMode="contain" />);
+  const mediaContent = (media?: PostMedia[]) => {
+    if (!media?.length) return null;
+    const multiple = media.length > 1;
+    return <View style={multiple ? styles.mediaGrid : undefined}>
+      {media.map((item, index) => item.media_type.startsWith("video/")
+        ? <PostVideo key={item.id} uri={`${API_URL}${item.url}`} token={token}
+            style={multiple ? styles.gridVideo : styles.postVideo} />
+        : <Pressable key={item.id} accessibilityRole="button"
+            accessibilityLabel={`View photo ${index + 1} of ${media.length} larger`}
+            onPress={() => showImage(`${API_URL}${item.url}`, `Post photo ${index + 1}`)}
+            style={multiple ? styles.mediaTile : styles.singleMedia}>
+            <Image source={{ uri: `${API_URL}${item.url}`, headers: { Authorization: `Bearer ${token}` } }}
+              style={styles.postImage} resizeMode="cover" />
+          </Pressable>)}
+    </View>;
+  };
   const quotedContent = (item?: Post | Reply | null, kind = "post") => item ? <View style={styles.quotedItem}>
     <Text style={styles.quotedLabel}>Original {kind} included</Text>
-    <View style={styles.postAuthor}><Avatar user={item.author} size={30} /><View><Text style={styles.author}>{item.author.display_name}</Text><Text style={styles.handle}>@{item.author.username}</Text></View></View>
-    {item.body ? <Text style={styles.postBody}>{item.body}</Text> : null}
+    <View style={styles.postAuthor}><Avatar user={item.author} size={30} onPress={profilePhotoAction(item.author)} /><View>
+      {profileLink(item.author.username, item.author.display_name)}
+      {profileLink(item.author.username, `@${item.author.username}`, styles.handle)}
+    </View></View>
+    {item.body ? <Text style={styles.postBody}>{taggedText(item.body)}</Text> : null}
     {mediaContent(item.media)}
   </View> : null;
   const replyCard = (reply: Reply) => <View key={reply.id} style={styles.replyCard}>
-    <View style={styles.postAuthor}><Avatar user={reply.author} size={36} /><View style={{ flex: 1 }}><Text style={styles.author}>{reply.author.display_name}</Text><Text style={styles.handle}>@{reply.author.username}</Text></View></View>
-    {reply.body ? <Text style={styles.postBody}>{reply.body}</Text> : null}
+    <View style={styles.postAuthor}><Avatar user={reply.author} size={36} onPress={profilePhotoAction(reply.author)} /><View style={{ flex: 1 }}>
+      {profileLink(reply.author.username, reply.author.display_name)}
+      {profileLink(reply.author.username, `@${reply.author.username}`, styles.handle)}
+    </View></View>
+    {reply.body ? <Text style={styles.postBody}>{taggedText(reply.body)}</Text> : null}
     {mediaContent(reply.media)}
     {reply.quoted_post ? quotedContent(reply.quoted_post, "post") : null}
     {reply.quoted_reply ? quotedContent(reply.quoted_reply, "reply") : null}
@@ -754,8 +1086,11 @@ export default function App() {
   </View>;
   const postCard = (post: Post) => <View key={post.id} style={styles.post}>
     {post.reposted_by ? <Text style={styles.repostLabel}>↗  Echoed by @{post.reposted_by.username}</Text> : null}
-    <View style={styles.postAuthor}><Avatar user={post.author} /><View style={{ flex: 1 }}><Text style={styles.author}>{post.author.display_name}</Text><Text style={styles.handle}>@{post.author.username} · {post.created_at}</Text></View></View>
-    {post.body ? <Text style={styles.postBody}>{post.body}</Text> : null}
+    <View style={styles.postAuthor}><Avatar user={post.author} onPress={profilePhotoAction(post.author)} /><View style={{ flex: 1 }}>
+      {profileLink(post.author.username, post.author.display_name)}
+      <View style={styles.row}>{profileLink(post.author.username, `@${post.author.username}`, styles.handle)}<Text style={styles.handle}> · {post.created_at}</Text></View>
+    </View></View>
+    {post.body ? <Text style={styles.postBody}>{taggedText(post.body)}</Text> : null}
     {mediaContent(post.media)}
     {post.quoted_post ? quotedContent(post.quoted_post, "post") : null}
     {post.quoted_reply ? quotedContent(post.quoted_reply, "reply") : null}
@@ -772,11 +1107,11 @@ export default function App() {
       <TextInput accessibilityLabel="Write a thoughtful reply" placeholder="Write a thoughtful reply…" placeholderTextColor="#8987a5"
         value={form[`reply-${post.id}`] || ""} onChangeText={value => update(`reply-${post.id}`, value)}
         multiline style={[styles.input, styles.multiline]} />
-      <View style={styles.row}>{button("Add photos or videos", () => pickPostMedia(true), true)}{replyMedia.length ? button("Clear media", () => setReplyMedia([]), true) : null}{button("Send reply", () => sendReply(post))}</View>
+      <View style={styles.row}><MediaPickerButton label="Attach photos, videos, or GIFs to reply" onPress={() => pickPostMedia(true)} />{replyMedia.length ? button("Clear media", () => setReplyMedia([]), true) : null}{button("Send reply", () => sendReply(post))}</View>
       {replyMedia.length ? <ScrollView horizontal style={styles.mediaSelection} contentContainerStyle={styles.mediaSelectionContent}>
         {replyMedia.map((asset, index) => <View key={`${asset.assetId || asset.uri}-${index}`} style={styles.mediaSelectionItem}>
           {asset.type === "video" ? <Text style={styles.mediaSelectionText}>Video</Text> : <Image source={{ uri: asset.uri }} style={styles.mediaSelectionImage} />}
-          <Pressable accessibilityRole="button" accessibilityLabel="Remove selected reply media" style={styles.mediaRemove} onPress={() => setReplyMedia(current => current.filter((_, itemIndex) => itemIndex !== index))}><Text style={styles.mediaRemoveText}>×</Text></Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel={`Remove selected reply media ${index + 1}`} style={styles.mediaRemove} onPress={() => setReplyMedia(current => current.filter((_, itemIndex) => itemIndex !== index))}><Text style={styles.mediaRemoveText}>×</Text></Pressable>
         </View>)}
       </ScrollView> : null}
     </View> : null}
@@ -872,6 +1207,7 @@ export default function App() {
             email: recoveryEmail, code: form.code, password: form.password,
           });
           await SecureStore.deleteItemAsync("zorlii_session");
+          resetConversationState();
           setToken(""); setMe(null); setScreen("login");
           setError("Password updated. Sign in with your new password.");
         } catch (e) { fail(e); }
@@ -894,19 +1230,59 @@ export default function App() {
     </View>;
     if (screen === "notifications") return <View>
       <Text style={styles.title}>Activities</Text>
-      <Text style={styles.copy}>Updates from members who follow, reply, react, repost, quote, or message you.</Text>
+      <Text style={styles.copy}>Updates from members who follow, reply, react, repost, quote, mention, or message you.</Text>
       <View style={styles.row}>
         {button("Refresh", loadNotifications, true)}
         {unreadNotifications ? button("Mark all as read", markAllNotificationsRead, true) : null}
       </View>
       {loading ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} /> : null}
       {notifications.map(item => <View key={item.id} style={[styles.post, !item.read && styles.unreadNotification]}>
-        <View style={styles.postAuthor}><Avatar user={item.actor} size={38} /><View><Text style={styles.author}>{item.actor.display_name}</Text><Text style={styles.handle}>@{item.actor.username}</Text></View></View>
-        <Text style={styles.copy}>{activityDescription(item.kind)}</Text>
+        <View style={styles.postAuthor}><Avatar user={item.actor} size={38} onPress={profilePhotoAction(item.actor)} /><View>
+          {profileLink(item.actor.username, item.actor.display_name)}
+          {profileLink(item.actor.username, `@${item.actor.username}`, styles.handle)}
+        </View></View>
+        <Text style={styles.copy}>{item.kind === "mention"
+          ? <>{profileLink(item.actor.username, `@${item.actor.username}`)} mentioned you.</>
+          : activityDescription(item.kind)}</Text>
+        {item.kind === "mention" && item.post_id
+          ? button("View mentioned post", () => { void openMentionTarget(item); }, true)
+          : null}
         <Text style={styles.handle}>{item.created_at}</Text>
         {!item.read ? button("Mark as read", () => markNotificationRead(item.id), true) : <Text style={styles.handle}>Read</Text>}
       </View>)}
       {!loading && !notifications.length ? <View style={styles.empty}><BrandHalo size={54} quiet /><Text style={styles.section}>You’re all caught up.</Text><Text style={styles.copy}>New activity from members will appear here.</Text></View> : null}
+    </View>;
+    if (screen === "social-profile") return <View>
+      {button("‹ Back", () => setScreen(profileReturnScreenRef.current), true)}
+      {publicProfile ? <>
+        <View style={styles.profileHero}>
+          <Avatar user={publicProfile} size={78} onPress={profilePhotoAction(publicProfile)} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.title}>{publicProfile.display_name}</Text>
+            {profileLink(publicProfile.username, `@${publicProfile.username}`, styles.handle)}
+          </View>
+        </View>
+        <Text style={styles.section}>A little about you</Text>
+        <Text style={styles.copy}>{publicProfile.bio || "A Zorlii member."}</Text>
+        <View style={styles.row}>
+          <View style={styles.countCard}><Text style={styles.countValue}>{publicProfilePosts.length}</Text><Text style={styles.countLabel}>Loaded posts</Text></View>
+          <View style={styles.countCard}><Text style={styles.countValue}>{publicProfile.follower_count}</Text><Text style={styles.countLabel}>Followers</Text></View>
+          <View style={styles.countCard}><Text style={styles.countValue}>{publicProfile.following_count}</Text><Text style={styles.countLabel}>Following</Text></View>
+        </View>
+        <View style={styles.row}>
+          {button("Message", () => startConversation(publicProfile.username), true)}
+          {button("Safety", () => showSafetyOptions(publicProfile), true)}
+        </View>
+        <Text style={styles.section}>Posts</Text>
+        {publicProfilePosts.map(post => postCard(post))}
+        {!publicProfilePosts.length ? <Text style={styles.copy}>No posts to show yet.</Text> : null}
+        {publicProfileHasMore ? <Pressable accessibilityRole="button"
+          accessibilityState={{ disabled: loadingPublicProfileOlder }}
+          disabled={loadingPublicProfileOlder} onPress={() => { void loadOlderProfilePosts(true); }}
+          style={({ pressed }) => [styles.button, styles.secondary, pressed && styles.buttonPressed]}>
+          <Text style={[styles.buttonText, styles.secondaryText]}>{loadingPublicProfileOlder ? "Loading older posts…" : "Load older posts"}</Text>
+        </Pressable> : null}
+      </> : !loading ? <Text style={styles.copy}>This profile could not be loaded.</Text> : null}
     </View>;
     if (screen === "social-followers" || screen === "social-following") {
       const isFollowers = screen === "social-followers";
@@ -916,8 +1292,8 @@ export default function App() {
         <Text style={styles.title}>{isFollowers ? "Followers" : "Following"}</Text>
         <Text style={styles.copy}>{isFollowers ? `${followerCount} members follow you.` : `${followingCount} members you follow.`}</Text>
         {people.map(person => <View key={person.id} style={styles.memberRow}>
-          <Avatar user={person} size={40} />
-          <View style={styles.memberIdentity}><Text style={styles.handle}>@{person.username}</Text><Text style={styles.copy}>{person.display_name}</Text></View>
+          <Avatar user={person} size={40} onPress={profilePhotoAction(person)} />
+          <View style={styles.memberIdentity}>{profileLink(person.username, person.display_name)}{profileLink(person.username, `@${person.username}`, styles.handle)}</View>
           {button("Message", () => startConversation(person.username), true)}
         </View>)}
         {!people.length ? <View style={styles.empty}><Text style={styles.section}>{isFollowers ? "No followers yet" : "Not following anyone yet"}</Text><Text style={styles.copy}>Member lists will appear here as your community grows.</Text></View> : null}
@@ -928,8 +1304,8 @@ export default function App() {
       <Text style={styles.title}>Blocked accounts</Text>
       <Text style={styles.copy}>Members you’ve blocked cannot interact with you through posts, follows, or messages.</Text>
       {blockedUsers.map(person => <View key={person.id} style={styles.memberRow}>
-        <Avatar user={person} size={40} />
-        <View style={styles.memberIdentity}><Text style={styles.handle}>@{person.username}</Text><Text style={styles.copy}>{person.display_name}</Text></View>
+        <Avatar user={person} size={40} onPress={profilePhotoAction(person)} />
+        <View style={styles.memberIdentity}>{profileLink(person.username, person.display_name)}{profileLink(person.username, `@${person.username}`, styles.handle)}</View>
         {button("Unblock", () => unblockUser(person.username), true)}
       </View>)}
       {!blockedUsers.length ? <View style={styles.empty}><Text style={styles.section}>No blocked accounts</Text><Text style={styles.copy}>Your blocked-account list is empty.</Text></View> : null}
@@ -940,7 +1316,10 @@ export default function App() {
       {button("Search", async () => { try { setSearch(await request(`/api/search?q=${encodeURIComponent((form.query || "").trim())}`)); } catch (e) { fail(e); } })}
       {search ? <View>
         <Text style={styles.section}>People</Text>{search.people.map((person: any) => <View key={person.id} style={styles.post}>
-          <View style={styles.postAuthor}><Avatar user={person} /><View><Text style={styles.handle}>@{person.username}</Text><Text style={styles.author}>{person.display_name}</Text></View></View>
+          <View style={styles.postAuthor}><Avatar user={person} onPress={profilePhotoAction(person)} /><View>
+            {profileLink(person.username, person.display_name)}
+            {profileLink(person.username, `@${person.username}`, styles.handle)}
+          </View></View>
           <Text style={styles.copy}>{person.bio || "A Zorlii member"}</Text>{button("Follow", async () => { try { await request(`/api/users/${person.username}/follow`, "POST"); } catch (e) { fail(e); } })}
           {button("Message", () => startConversation(person.username), true)}
           {button("Safety", () => showSafetyOptions(person), true)}
@@ -956,8 +1335,8 @@ export default function App() {
         {field("recipient", "Search by username")}
         {button("Find members", searchInboxMembers)}
         {inboxSearchResults.map(person => <View key={person.id} style={styles.memberRow}>
-          <Avatar user={person} size={40} />
-          <View style={styles.memberIdentity}><Text style={styles.handle}>@{person.username}</Text><Text style={styles.copy}>{person.display_name}</Text></View>
+          <Avatar user={person} size={40} onPress={profilePhotoAction(person)} />
+          <View style={styles.memberIdentity}>{profileLink(person.username, person.display_name)}{profileLink(person.username, `@${person.username}`, styles.handle)}</View>
           {button("Message", () => startConversation(person.username), true)}
         </View>)}
         {inboxSearchResults.length === 0 && form.recipient ? <Text style={styles.handle}>Search for a member to begin.</Text> : null}
@@ -965,106 +1344,185 @@ export default function App() {
       <Text style={styles.section}>Your conversations</Text>
       {conversations.map(c => {
         const person = c.participants.find(participant => participant.id !== me?.id) || c.participants[0];
-        return <Pressable key={c.id} accessibilityRole="button" style={styles.threadRow} onPress={() => loadConversation(c.id)}>
-          <Avatar user={person} size={42} />
-          <View style={styles.memberIdentity}><Text style={styles.author}>{person?.display_name || "Conversation"}</Text><Text style={styles.handle}>@{person?.username || ""}</Text><Text numberOfLines={1} style={styles.copy}>{c.last_message || "No messages yet"}</Text></View>
-        </Pressable>;
+        return <View key={c.id} style={styles.threadRow}>
+          <Avatar user={person} size={42} onPress={profilePhotoAction(person)} />
+          <View style={styles.memberIdentity}>
+            {person ? profileLink(person.username, person.display_name) : <Text style={styles.author}>Conversation</Text>}
+            {person ? profileLink(person.username, `@${person.username}`, styles.handle) : null}
+            <Text numberOfLines={1} style={styles.copy}>{c.last_message || "No messages yet"}</Text>
+            <Pressable accessibilityRole="button" accessibilityLabel={`Open conversation with @${person?.username || "member"}`}
+              onPress={() => loadConversation(c.id)} style={styles.threadOpen}>
+              <Text style={styles.threadOpenText}>Open conversation →</Text>
+            </Pressable>
+          </View>
+        </View>;
       })}
       {!conversations.length && <Text style={styles.copy}>Your inbox is quiet. Start a conversation when you’re ready.</Text>}
     </View>;
-    if (screen === "messages") return <View>
-      {button("‹ Inbox", loadInbox, true)}<Text style={styles.title}>Conversation</Text>
-      {(() => { const person = conversations.find(item => item.id === conversationId)?.participants.find(item => item.id !== me?.id); return person ? button("Safety options", () => showSafetyOptions(person), true) : null; })()}
-      <View style={styles.messageList}>{messages.map(m => <View key={m.id} style={[styles.message, m.sender_id === me?.id && styles.myMessage]}>
-        <Text style={styles.messageAuthor}>{m.sender_id === me?.id ? "You" : `@${m.author.username}`}</Text><Text style={styles.copy}>{m.body}</Text>
-      </View>)}</View>
-      {field("message", "Write a message", false, true)}
-      {button("Send", async () => { try { await request(`/api/conversations/${conversationId}/messages`, "POST", { body: form.message }); update("message", ""); setMessages((await request(`/api/conversations/${conversationId}/messages`)).messages); } catch (e) { fail(e); } })}
-    </View>;
+    if (screen === "messages") {
+      const person = conversations.find(item => item.id === conversationId)?.participants.find(item => item.id !== me?.id);
+      return <View>
+        {button("‹ Inbox", loadInbox, true)}
+        <Text style={styles.title}>{person ? profileLink(person.username, person.display_name) : "Conversation"}</Text>
+        {person ? button("Safety options", () => showSafetyOptions(person), true) : null}
+        <View style={styles.messageList}>
+          <Text style={styles.conversationDate}>{conversationCreatedAt
+            ? `Conversation started ${formatConversationDate(conversationCreatedAt)}`
+            : "Conversation date unavailable"}</Text>
+          <ScrollView ref={messageScrollRef} style={styles.messageScroll} contentContainerStyle={styles.messageScrollContent}
+            nestedScrollEnabled keyboardShouldPersistTaps="handled"
+            onScroll={event => { messageScrollYRef.current = event.nativeEvent.contentOffset.y; }}
+            onScrollBeginDrag={() => { messageLatestTargetRef.current = null; }}
+            scrollEventThrottle={16}>
+            {hasMoreMessages ? <Pressable accessibilityRole="button" accessibilityLabel="Load older messages"
+              accessibilityState={{ disabled: loadingOlderMessages }} disabled={loadingOlderMessages}
+              onPress={() => { void loadOlderMessages(); }} style={styles.loadOlderButton}>
+              {loadingOlderMessages ? <ActivityIndicator color="#cdb6ff" /> : <Text style={styles.loadOlderText}>↑  Load older messages</Text>}
+            </Pressable> : null}
+            {loadingMessages && !messages.length
+              ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} />
+              : !messages.length ? <Text style={styles.copy}>No messages yet. Send a note to begin.</Text> : messages.map(message =>
+              <View key={message.id} onLayout={event => onMessageLayout(message.id, event.nativeEvent.layout.y)}
+                style={[styles.message, message.sender_id === me?.id && styles.myMessage]}>
+                {message.sender_id === me?.id
+                  ? <Text style={styles.messageAuthor}>You</Text>
+                  : profileLink(message.author.username, `@${message.author.username}`, styles.messageAuthor)}
+                <Text style={styles.messageBody}>{taggedText(message.body)}</Text>
+                <Text style={styles.messageTime}>{formatMessageTime(message.created_at)}</Text>
+              </View>)}
+          </ScrollView>
+        </View>
+        {field("message", "Write a message", false, true)}
+        {button("Send", async () => {
+          if (!form.message?.trim() || conversationId === null) return;
+          try {
+            await request(`/api/conversations/${conversationId}/messages`, "POST", { body: form.message });
+            update("message", "");
+            await refreshConversationMessages(conversationId, true);
+          } catch (e) { fail(e); }
+        })}
+      </View>;
+    }
     if (screen === "profile") return <View>
-      <View style={styles.profileHero}><Avatar user={me} size={88} /><View style={{ flex: 1 }}><Text style={styles.title}>{me?.display_name || "Your profile"}</Text><Text style={styles.handle}>@{me?.username} · {me?.email}</Text></View></View>
-      {button(me?.avatar_url ? "Change profile photo" : "Add profile photo", pickAvatar, true)}
-      {me?.avatar_url ? button("Remove profile photo", confirmAvatarRemoval, true) : null}
-      <Text style={styles.copy}>Your photo appears with your profile and posts.</Text>
-      <View style={styles.row}>
-        <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-followers")}><Text style={styles.countValue}>{followerCount}</Text><Text style={styles.copy}>Followers</Text></Pressable>
-        <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-following")}><Text style={styles.countValue}>{followingCount}</Text><Text style={styles.copy}>Following</Text></Pressable>
+      <View style={styles.profileHero}>
+        <View style={styles.profileAvatarWrap}>
+          <Avatar user={me} size={88} onPress={profilePhotoAction(me)} />
+          <Pressable accessibilityRole="button" accessibilityLabel="Upload profile photo"
+            accessibilityHint="Choose a new photo for your profile."
+            onPress={pickAvatar} style={({ pressed }) => [styles.avatarUploadButton, pressed && styles.buttonPressed]}>
+            <Text style={styles.avatarUploadText} accessibilityElementsHidden>+</Text>
+          </Pressable>
+        </View>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          {me?.username ? profileLink(me.username, me.display_name || "Your profile", styles.title) : <Text style={styles.title}>Your profile</Text>}
+          {me?.username ? profileLink(me.username, `@${me.username}`, styles.handle) : null}
+        </View>
       </View>
-      <Text style={styles.section}>More &amp; account safety</Text>
-      <Text style={styles.copy}>Manage member boundaries and safety settings.</Text>
-      {button(`Blocked accounts · ${blockedUsers.length}`, () => setScreen("blocked"), true)}
-      {field("display_name", "Display name")}{field("bio", "A little about you", false, true)}{field("interests", "Interests, separated by commas")}
-      <Text style={styles.section}>Privacy & local tools</Text>
-      <Text style={styles.copy}>Both features stay off until you opt in. Recommendations compare real public posts; context help selects supplied sentences. No generative AI is used.</Text>
-      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.recommendations_consent ? form.recommendations_consent === "true" : Boolean(me?.recommendations_consent) }} style={styles.checkLine} onPress={() => update("recommendations_consent", String(!(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent)))}><Text>{(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent) ? "☑" : "□"}  Local recommendations from real public posts. No generative AI service.</Text></Pressable>
-      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_assistance_consent ? form.context_assistance_consent === "true" : Boolean(me?.context_assistance_consent) }} style={styles.checkLine} onPress={() => update("context_assistance_consent", String(!(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent)))}><Text>{(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent) ? "☑" : "□"}  Local extractive context help. Each request needs confirmation; no answer is generated.</Text></Pressable>
-      {button("Save profile", async () => { try { const result = await request("/api/profile", "PATCH", {
-        display_name: form.display_name || me?.display_name, bio: form.bio ?? me?.bio,
-        interests: (form.interests ?? me?.interests.join(",") ?? "").split(",").map(x => x.trim()).filter(Boolean),
-        recommendations_consent: form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent,
-        context_assistance_consent: form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent,
-      }); setMe(result.user); Alert.alert("Saved", "Your profile and choices have been updated."); } catch (e) { fail(e); } })}
-      {me?.recommendations_consent ? <>
-        <Text style={styles.section}>Member suggestions</Text>
-        <Text style={styles.copy}>A local comparison of opted-in interests and real public posts, not a generative AI service.</Text>
-        {button("Find members from real posts", async () => {
-          try { setRecommendations((await request("/api/recommendations")).recommendations); }
-          catch (e) { fail(e); }
-        }, true)}
-        {recommendations.map(person => <View key={person.id} style={styles.post}>
-          <View style={styles.postAuthor}><Avatar user={person} /><View><Text style={styles.author}>{person.display_name}</Text><Text style={styles.handle}>@{person.username}</Text></View></View>
-          <Text style={styles.copy}>{person.bio || "A member sharing public posts."}</Text>
-          {button("Follow", async () => { try { await request(`/api/users/${person.username}/follow`, "POST"); } catch (e) { fail(e); } })}
-          {button("Message", () => startConversation(person.username), true)}
+      <Text style={styles.section}>A little about you</Text>
+      <Text style={styles.copy}>{me?.bio || "Add a little about you to help others get to know you."}</Text>
+      <View style={styles.row}>
+        <View style={styles.countCard}><Text style={styles.countValue}>{activityCounts?.posts ?? "—"}</Text><Text style={styles.countLabel}>Posts</Text></View>
+        <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-followers")}><Text style={styles.countValue}>{followerCount}</Text><Text style={styles.countLabel}>Followers</Text></Pressable>
+        <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-following")}><Text style={styles.countValue}>{followingCount}</Text><Text style={styles.countLabel}>Following</Text></Pressable>
+      </View>
+      <View style={styles.row}>
+        {(["media", "replies", "likes", "echoes"] as const).map(key => <View key={key} style={styles.countCard}>
+          <Text style={styles.countValue}>{activityCounts?.[key] ?? "—"}</Text>
+          <Text style={styles.countLabel}>{key[0].toUpperCase() + key.slice(1)}</Text>
         </View>)}
-        {!recommendations.length ? <Text style={styles.copy}>Suggestions use real public member posts; none may be available yet.</Text> : null}
-      </> : null}
-      <Text style={styles.section}>Local context help</Text>
-      <Text style={styles.copy}>Your text is processed in memory only. Opt in above, then confirm each request.</Text>
-      {field("context_text", "Paste text you want help with", false, true)}
-      {field("context_question", "What would you like to find?", false)}
-      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_confirm === "true" }} style={styles.checkLine} onPress={() => update("context_confirm", form.context_confirm === "true" ? "false" : "true")}>
-        <Text>{form.context_confirm === "true" ? "☑" : "□"}  Use this text locally for this request</Text>
-      </Pressable>
-      {button("Find relevant sentences", async () => {
-        if (form.context_confirm !== "true") { setError("Confirm use of this text for this request first."); return; }
-        try {
-          const result = await request("/api/context", "POST", {
-            text: form.context_text || "", question: form.context_question || "", consent_for_this_request: true,
-          });
-          setContextResult(result.sentences.length ? result.sentences.join("\n\n") : "No relevant sentences found.");
-          update("context_confirm", "false");
-        } catch (e) { fail(e); }
-      })}
-      {contextResult ? <Text style={styles.copy}>{contextResult}</Text> : null}
-      <Text style={styles.section}>Phone notifications</Text>
-      <Text style={styles.copy}>Get activity alerts when Zorlii is in the background.</Text>
-      {button("Enable activity alerts", async () => {
-        try {
-          const enabled = await registerPushToken(token);
-          Alert.alert(
-            enabled ? "Activity alerts enabled" : "Notifications are off",
-            enabled ? "This device is ready to receive Zorlii activity alerts." : "Allow notifications in your device settings, then try again.",
-          );
-        } catch (e) { fail(e); }
-      }, true)}
+      </View>
+      <View style={styles.row}>
+        {(["saved", "messages"] as const).map(key => <View key={key} style={styles.countCard}>
+          <Text style={styles.countValue}>{activityCounts?.[key] ?? "—"}</Text>
+          <Text style={styles.countLabel}>{key === "messages" ? "Messages sent" : "Saved"}</Text>
+        </View>)}
+      </View>
       <Text style={styles.section}>Your posts</Text>
       {profilePosts.map(post => postCard(post))}
       {!profilePosts.length ? <Text style={styles.copy}>Your posts will appear here when you share them.</Text> : null}
-      <Text style={styles.section}>Your data</Text>
-      <Text style={styles.copy}>Export a copy of your account data or permanently close your account.</Text>
-      {button("Export my account data", exportAccount, true)}
-      {button("Privacy Policy", () => { void Linking.openURL(`${API_URL}/privacy`).catch(fail); }, true)}
-      {button("Terms of Use", () => { void Linking.openURL(`${API_URL}/terms`).catch(fail); }, true)}
-      {button("Request account deletion online", () => { void Linking.openURL(`${API_URL}/account-deletion`).catch(fail); }, true)}
-      {button("Delete account", () => { setForm({}); setScreen("delete-account"); })}
-      {button("Sign out", logout, true)}
-      {me?.is_moderator ? <>
-        <Text style={styles.section}>Moderator reports</Text>
+      {profileHasMore ? <Pressable accessibilityRole="button"
+        accessibilityState={{ disabled: loadingProfileOlder }}
+        disabled={loadingProfileOlder} onPress={() => { void loadOlderProfilePosts(false); }}
+        style={({ pressed }) => [styles.button, styles.secondary, pressed && styles.buttonPressed]}>
+        <Text style={[styles.buttonText, styles.secondaryText]}>{loadingProfileOlder ? "Loading older posts…" : "Load older posts"}</Text>
+      </Pressable> : null}
+      <Text style={styles.section}>Profile tools</Text>
+      {disclosure("edit-profile", "Edit profile", <>
+        {field("display_name", "Display name")}
+        {field("bio", "A little about you", false, true)}
+        {field("interests", "Interests, separated by commas")}
+        {me?.avatar_url ? button("Remove profile photo", confirmAvatarRemoval, true) : null}
+        {button("Save profile", () => { void saveProfileSection("profile"); })}
+      </>)}
+      {disclosure("privacy-tools", "Privacy & local tools", <>
+        {button(`Blocked accounts · ${blockedUsers.length}`, () => setScreen("blocked"), true)}
+        <Text style={styles.copy}>Features stay off until you opt in. Recommendations compare real public posts; context help selects supplied sentences. No generative AI is used.</Text>
+        <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.recommendations_consent ? form.recommendations_consent === "true" : Boolean(me?.recommendations_consent) }} style={styles.checkLine} onPress={() => update("recommendations_consent", String(!(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent)))}><Text>{(form.recommendations_consent ? form.recommendations_consent === "true" : me?.recommendations_consent) ? "☑" : "□"}  Local recommendations from real public posts. No generative AI service.</Text></Pressable>
+        <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_assistance_consent ? form.context_assistance_consent === "true" : Boolean(me?.context_assistance_consent) }} style={styles.checkLine} onPress={() => update("context_assistance_consent", String(!(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent)))}><Text>{(form.context_assistance_consent ? form.context_assistance_consent === "true" : me?.context_assistance_consent) ? "☑" : "□"}  Local extractive context help. Each request needs confirmation; no answer is generated.</Text></Pressable>
+        {button("Save privacy choices", () => { void saveProfileSection("privacy"); })}
+        {me?.recommendations_consent ? <>
+          <Text style={styles.section}>Member suggestions</Text>
+          <Text style={styles.copy}>A local comparison of opted-in interests and real public posts, not a generative AI service.</Text>
+          {button("Find members from real posts", async () => {
+            try { setRecommendations((await request("/api/recommendations")).recommendations); }
+            catch (e) { fail(e); }
+          }, true)}
+          {recommendations.map(person => <View key={person.id} style={styles.post}>
+            <View style={styles.postAuthor}><Avatar user={person} onPress={profilePhotoAction(person)} /><View>
+              {profileLink(person.username, person.display_name)}
+              {profileLink(person.username, `@${person.username}`, styles.handle)}
+            </View></View>
+            <Text style={styles.copy}>{person.bio || "A member sharing public posts."}</Text>
+            {button("Follow", async () => { try { await request(`/api/users/${person.username}/follow`, "POST"); } catch (e) { fail(e); } })}
+            {button("Message", () => startConversation(person.username), true)}
+          </View>)}
+          {!recommendations.length ? <Text style={styles.copy}>Suggestions use real public member posts; none may be available yet.</Text> : null}
+        </> : null}
+      </>)}
+      {disclosure("local-context", "Local context help", <>
+        <Text style={styles.copy}>Your text is processed in memory only. Opt in under Privacy &amp; local tools, then confirm each request.</Text>
+        {field("context_text", "Paste text you want help with", false, true)}
+        {field("context_question", "What would you like to find?", false)}
+        <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: form.context_confirm === "true" }} style={styles.checkLine} onPress={() => update("context_confirm", form.context_confirm === "true" ? "false" : "true")}>
+          <Text>{form.context_confirm === "true" ? "☑" : "□"}  Use this text locally for this request</Text>
+        </Pressable>
+        {button("Find relevant sentences", async () => {
+          if (form.context_confirm !== "true") { setError("Confirm use of this text for this request first."); return; }
+          try {
+            const result = await request("/api/context", "POST", {
+              text: form.context_text || "", question: form.context_question || "", consent_for_this_request: true,
+            });
+            setContextResult(result.sentences.length ? result.sentences.join("\n\n") : "No relevant sentences found.");
+            update("context_confirm", "false");
+          } catch (e) { fail(e); }
+        })}
+        {contextResult ? <Text style={styles.copy}>{contextResult}</Text> : null}
+      </>)}
+      {disclosure("account-help", "Notifications, help & account", <>
+        <Text style={styles.copy}>Get activity alerts when Zorlii is in the background.</Text>
+        {button("Enable activity alerts", async () => {
+          try {
+            const enabled = await registerPushToken(token);
+            Alert.alert(
+              enabled ? "Activity alerts enabled" : "Notifications are off",
+              enabled ? "This device is ready to receive Zorlii activity alerts." : "Allow notifications in your device settings, then try again.",
+            );
+          } catch (e) { fail(e); }
+        }, true)}
+        <Text style={styles.section}>Your data</Text>
+        <Text style={styles.copy}>Export a copy of your account data or permanently close your account.</Text>
+        {button("Export my account data", exportAccount, true)}
+        {button("Privacy Policy", () => { void Linking.openURL(`${API_URL}/privacy`).catch(fail); }, true)}
+        {button("Terms of Use", () => { void Linking.openURL(`${API_URL}/terms`).catch(fail); }, true)}
+        {button("Request account deletion online", () => { void Linking.openURL(`${API_URL}/account-deletion`).catch(fail); }, true)}
+        {button("Delete account", () => { setForm({}); setScreen("delete-account"); })}
+        {button("Sign out", logout, true)}
+      </>)}
+      {me?.is_moderator ? disclosure("moderator-reports", "Moderator reports", <>
         {button("Refresh open reports", loadModerationReports, true)}
         {moderationReports.map(report => <View key={report.id} style={styles.post}>
           <Text style={styles.author}>{report.target_type === "post" ? "Post" : "Account"} · {report.target_username ? `@${report.target_username}` : "removed content"}</Text>
-          {report.post_body ? <Text style={styles.copy}>{report.post_body}</Text> : null}
+          {report.post_body ? <Text style={styles.copy}>{taggedText(report.post_body)}</Text> : null}
           <Text style={styles.handle}>Reported by @{report.reporter_username} · {report.reason} · {report.created_at}</Text>
           {report.details ? <Text style={styles.copy}>{report.details}</Text> : null}
           <View style={styles.row}>
@@ -1074,7 +1532,7 @@ export default function App() {
           </View>
         </View>)}
         {!moderationReports.length ? <Text style={styles.copy}>No open reports are currently loaded.</Text> : null}
-      </> : null}
+      </>) : null}
     </View>;
     return <View>
       <Text style={styles.eyebrow}>Your community, in focus</Text><Text style={styles.title}>Pulse</Text>
@@ -1082,17 +1540,20 @@ export default function App() {
       <TextInput ref={composerRef} accessibilityLabel="Write a post" placeholder="What would you like to share?" multiline maxLength={5000} value={form.post || ""} onChangeText={value => update("post", value)} style={[styles.input, styles.multiline]} />
       {quoteTarget ? <View style={styles.quotePreview}>
         <Text style={styles.quotedLabel}>Echo with a thought · original {quoteTarget.type}</Text>
-        <View style={styles.postAuthor}><Avatar user={quoteTarget.item.author} size={30} /><View><Text style={styles.author}>{quoteTarget.item.author.display_name}</Text><Text style={styles.handle}>@{quoteTarget.item.author.username}</Text></View></View>
-        <Text numberOfLines={3} style={styles.copy}>{quoteTarget.item.body || "Media post"}</Text>
+        <View style={styles.postAuthor}><Avatar user={quoteTarget.item.author} size={30} onPress={profilePhotoAction(quoteTarget.item.author)} /><View>
+          {profileLink(quoteTarget.item.author.username, quoteTarget.item.author.display_name)}
+          {profileLink(quoteTarget.item.author.username, `@${quoteTarget.item.author.username}`, styles.handle)}
+        </View></View>
+        <Text numberOfLines={3} style={styles.copy}>{taggedText(quoteTarget.item.body || "Media post")}</Text>
         {mediaContent(quoteTarget.item.media)}
         {button("Remove original", () => setQuoteTarget(null), true)}
       </View> : null}
       <View style={styles.row}><Text style={styles.copy}>Visible to: </Text><Pressable onPress={() => update("visibility", form.visibility === "public" ? "followers" : form.visibility === "followers" ? "private" : "public")}><Text style={styles.link}>{form.visibility || "public"} ⌄</Text></Pressable></View>
-      <View style={styles.row}>{button("Add photos or videos", pickPostMedia, true)}{postMedia.length ? button("Clear media", () => setPostMedia([]), true) : null}</View>
+      <View style={styles.row}><MediaPickerButton label="Attach photos, videos, or GIFs to post" onPress={pickPostMedia} />{postMedia.length ? button("Clear media", () => setPostMedia([]), true) : null}</View>
       {postMedia.length ? <ScrollView horizontal style={styles.mediaSelection} contentContainerStyle={styles.mediaSelectionContent}>
         {postMedia.map((asset, index) => <View key={`${asset.assetId || asset.uri}-${index}`} style={styles.mediaSelectionItem}>
           {asset.type === "video" ? <Text style={styles.mediaSelectionText}>Video</Text> : <Image source={{ uri: asset.uri }} style={styles.mediaSelectionImage} />}
-          <Pressable accessibilityRole="button" accessibilityLabel="Remove selected media" style={styles.mediaRemove} onPress={() => setPostMedia(current => current.filter((_, itemIndex) => itemIndex !== index))}><Text style={styles.mediaRemoveText}>×</Text></Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel={`Remove selected media ${index + 1}`} style={styles.mediaRemove} onPress={() => setPostMedia(current => current.filter((_, itemIndex) => itemIndex !== index))}><Text style={styles.mediaRemoveText}>×</Text></Pressable>
         </View>)}
       </ScrollView> : null}
       {button("Share thought", sharePost)}
@@ -1101,21 +1562,37 @@ export default function App() {
     </View>;
   }
 
-  return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+  return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={0}>
     <StatusBar style="light" />
-    <View style={styles.header}><BrandHalo size={42} showLogo /><View style={styles.headerCopy}><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub} numberOfLines={1}>A thoughtful little corner</Text></View>
-      {me ? <View style={styles.userTag}><Avatar user={me} size={24} /><Text style={styles.userTagText} numberOfLines={1}>@{me.username}</Text></View> : null}</View>
-    <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
+    <View style={[styles.header, { paddingTop: 10 + insets.top }]}><BrandHalo size={42} showLogo /><View style={styles.headerCopy}><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub} numberOfLines={1}>A thoughtful little corner</Text></View>
+      {me ? <View style={styles.userTag}><Avatar user={me} size={24} onPress={profilePhotoAction(me)} /><Text accessibilityRole="link"
+        onPress={() => loadProfile()} style={styles.userTagText} numberOfLines={1}>@{me.username}</Text></View> : null}</View>
+    <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled" keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+      automaticallyAdjustKeyboardInsets={Platform.OS === "ios"} contentContainerStyle={styles.content}>
       {error ? <Pressable onPress={() => setError("")} style={styles.error}><Text style={styles.errorText}>{error}  ×</Text></Pressable> : null}
       {loading && screen !== "feed" ? <ActivityIndicator color="#a47dff" /> : null}
       {renderBody()}
     </ScrollView>
-    {me?.terms_accepted ? nav() : null}
+    {me?.terms_accepted ? <View style={{ paddingBottom: insets.bottom, backgroundColor: "#0b1020" }}>{nav()}</View> : null}
+    <Modal visible={Boolean(selectedImage)} transparent animationType="fade" onRequestClose={() => setSelectedImage(null)}>
+      <View style={styles.imageModalRoot} accessibilityViewIsModal>
+        <Pressable style={StyleSheet.absoluteFill} accessibilityRole="button" accessibilityLabel="Close photo viewer"
+          onPress={() => setSelectedImage(null)} />
+        {selectedImage ? <>
+          <Pressable accessibilityRole="button" accessibilityLabel="Close photo viewer"
+            onPress={() => setSelectedImage(null)} style={[styles.imageModalClose, { top: insets.top + 12, right: 18 }]}>
+            <Text style={styles.imageModalCloseText}>×</Text>
+          </Pressable>
+          <Image source={{ uri: selectedImage.uri, headers: { Authorization: `Bearer ${token}` } }}
+            accessibilityLabel={selectedImage.label} style={styles.imageModalImage} resizeMode="contain" />
+        </> : null}
+      </View>
+    </Modal>
     <Modal visible={!!echoTarget} transparent animationType="fade" onRequestClose={() => setEchoTarget(null)}>
       <View style={styles.echoModalRoot}>
         <Pressable style={StyleSheet.absoluteFill} accessibilityRole="button" accessibilityLabel="Close Echo options"
           onPress={() => setEchoTarget(null)} />
-        {echoTarget ? <View style={styles.echoSheet} accessibilityViewIsModal>
+        {echoTarget ? <View style={[styles.echoSheet, { paddingBottom: Math.max(insets.bottom + 12, 24) }]} accessibilityViewIsModal>
           <View style={styles.echoHandle} />
           <Text accessibilityRole="header" style={styles.echoSheetTitle}>Echo</Text>
           <Text style={styles.echoSheetDescription}>Choose how you’d like to share this {echoTarget.type}.</Text>
@@ -1140,9 +1617,14 @@ export default function App() {
   </KeyboardAvoidingView>;
 }
 
+export default function App() {
+  return <SafeAreaProvider><AppContent /></SafeAreaProvider>;
+}
+
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#070713" },
-  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 18, paddingTop: Platform.OS === "ios" ? 57 : 28, paddingBottom: 13, backgroundColor: "#0b1020", borderBottomWidth: 1, borderBottomColor: "#30264a" },
+  scroll: { flex: 1 },
+  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 18, paddingBottom: 13, backgroundColor: "#0b1020", borderBottomWidth: 1, borderBottomColor: "#30264a" },
   logo: { width: 42, height: 42, borderRadius: 14, backgroundColor: "#17132a" },
   brandHaloWrap: { alignItems: "center", justifyContent: "center", position: "relative", borderWidth: 1, borderColor: "#8b5fe0", shadowColor: "#8b35ff", shadowOpacity: 0.38, shadowRadius: 10, shadowOffset: { width: 0, height: 2 }, elevation: 3 },
   quietBrandHaloWrap: { borderColor: "#51456b", shadowOpacity: 0, elevation: 0 },
@@ -1154,7 +1636,7 @@ const styles = StyleSheet.create({
   brandPulse: { position: "absolute", top: 3, right: 3, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: "#d1b6ff", backgroundColor: "#74d7ff" },
   quietBrandPulse: { opacity: 0.55 },
   brand: { color: "#f6f1f8", fontSize: 20, fontWeight: "800", letterSpacing: 2.4, textTransform: "uppercase" }, headerCopy: { flexShrink: 1, minWidth: 0 }, headerSub: { color: "#b8b2c3", fontSize: 12 }, userTag: { flexDirection: "row", alignItems: "center", gap: 3, marginLeft: "auto", maxWidth: 110, flexShrink: 1 }, userTagText: { color: "#e9e4ee", fontSize: 11, minWidth: 0, flexShrink: 1 },
-  tabs: { flexDirection: "row", alignItems: "center", justifyContent: "space-around", backgroundColor: "#0b1020", paddingTop: 7, paddingBottom: Platform.OS === "ios" ? 24 : 8, paddingHorizontal: 4, borderTopWidth: 1, borderTopColor: "#30264a" },
+  tabs: { flexDirection: "row", alignItems: "center", justifyContent: "space-around", backgroundColor: "#0b1020", paddingTop: 7, paddingBottom: 8, paddingHorizontal: 4, borderTopWidth: 1, borderTopColor: "#30264a" },
   tabItem: { width: "16.66%", minHeight: 53, alignItems: "center", justifyContent: "center", borderRadius: 11, paddingVertical: 3, position: "relative" },
   tabPressed: { backgroundColor: "#21173b" },
   createTab: { alignSelf: "center" },
@@ -1175,7 +1657,11 @@ const styles = StyleSheet.create({
   buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "#17132a", borderWidth: 1, borderColor: "#40335d", shadowOpacity: 0, elevation: 0 }, secondaryText: { color: "#d9c7f5" },
   echoSelected: { backgroundColor: "#281a45", borderColor: "#a855f7" }, echoSelectedText: { color: "#e5cbff" },
   echoModalRoot: { flex: 1, justifyContent: "flex-end", backgroundColor: "#05050dcc" },
-  echoSheet: { backgroundColor: "#111329", borderWidth: 1, borderColor: "#7650ad", borderBottomWidth: 0, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 20, paddingTop: 12, paddingBottom: Platform.OS === "ios" ? 34 : 24, shadowColor: "#8b35ff", shadowOpacity: 0.24, shadowRadius: 22, shadowOffset: { width: 0, height: -5 }, elevation: 18 },
+  imageModalRoot: { flex: 1, backgroundColor: "#05050df5", alignItems: "center", justifyContent: "center", padding: 18 },
+  imageModalImage: { width: "100%", height: "82%" },
+  imageModalClose: { position: "absolute", top: 38, right: 20, zIndex: 1, width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center", backgroundColor: "#211b31", borderWidth: 1, borderColor: "#615075" },
+  imageModalCloseText: { color: "#fff", fontSize: 30, lineHeight: 34 },
+  echoSheet: { backgroundColor: "#111329", borderWidth: 1, borderColor: "#7650ad", borderBottomWidth: 0, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingHorizontal: 20, paddingTop: 12, shadowColor: "#8b35ff", shadowOpacity: 0.24, shadowRadius: 22, shadowOffset: { width: 0, height: -5 }, elevation: 18 },
   echoHandle: { alignSelf: "center", width: 42, height: 4, borderRadius: 2, backgroundColor: "#75628f", marginBottom: 16 },
   echoSheetTitle: { color: "#faf8ff", fontSize: 20, fontWeight: "700" },
   echoSheetDescription: { color: "#aaa7c7", lineHeight: 21, marginTop: 5, marginBottom: 14 },
@@ -1186,31 +1672,54 @@ const styles = StyleSheet.create({
   echoCancel: { minHeight: 48, justifyContent: "center", alignItems: "center", marginTop: 5, borderRadius: 12, borderWidth: 1, borderColor: "#302a4d", backgroundColor: "#0b1020" },
   echoCancelText: { color: "#c7bfdc", fontWeight: "600" },
   post: { borderWidth: 1, borderColor: "#342d53", borderRadius: 17, backgroundColor: "#111329", padding: 16, marginVertical: 7, shadowColor: "#31175f", shadowOpacity: 0.22, shadowRadius: 14, shadowOffset: { width: 0, height: 5 }, elevation: 2 }, author: { color: "#f3efff", fontWeight: "700" },
+  profileLink: { color: "#d8c2ff", textDecorationLine: "underline" },
+  mention: { color: "#d9c0ff", fontWeight: "700" },
   postAuthor: { flexDirection: "row", alignItems: "center", gap: 11, marginBottom: 10 },
-  postImage: { width: "100%", height: 280, backgroundColor: "#070713", borderRadius: 13, marginVertical: 8 },
+  postImage: { width: "100%", height: "100%", backgroundColor: "#070713", borderRadius: 13 },
+  singleMedia: { width: "100%", height: 280, backgroundColor: "#070713", borderRadius: 13, overflow: "hidden", marginVertical: 8 },
+  mediaGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginVertical: 8 },
+  mediaTile: { width: "48%", aspectRatio: 1, backgroundColor: "#070713", borderRadius: 13, overflow: "hidden" },
+  gridVideo: { width: "48%", height: 160, backgroundColor: "#070713", borderRadius: 13, overflow: "hidden" },
   postVideo: { width: "100%", height: 240, backgroundColor: "#070713", borderRadius: 13, marginVertical: 8 },
   mediaSelection: { maxHeight: 92, marginVertical: 7 }, mediaSelectionContent: { gap: 8, paddingRight: 4 },
   mediaSelectionItem: { width: 78, height: 78, borderRadius: 12, overflow: "hidden", backgroundColor: "#302b3b", alignItems: "center", justifyContent: "center" },
   mediaSelectionImage: { width: "100%", height: "100%" }, mediaSelectionText: { color: "#e8e1ff", fontSize: 12, fontWeight: "700" },
-  mediaRemove: { position: "absolute", top: 3, right: 3, width: 30, height: 30, borderRadius: 15, backgroundColor: "#171521", alignItems: "center", justifyContent: "center" },
+  mediaPickerButton: { width: 48, height: 48, borderRadius: 15, alignItems: "center", justifyContent: "center", backgroundColor: "#211638", borderWidth: 1, borderColor: "#755aa1", shadowColor: "#8b35ff", shadowOpacity: 0.2, shadowRadius: 7, shadowOffset: { width: 0, height: 2 }, elevation: 2 },
+  mediaPickerIcon: { color: "#e6d5ff", fontSize: 30, lineHeight: 34, fontWeight: "400" },
+  mediaRemove: { position: "absolute", top: 0, right: 0, width: 44, height: 44, borderRadius: 22, backgroundColor: "#171521cc", alignItems: "center", justifyContent: "center" },
   mediaRemoveText: { color: "#fff", fontSize: 18, lineHeight: 21, fontWeight: "700" },
   avatarHalo: { alignItems: "center", justifyContent: "center", position: "relative", backgroundColor: "#17132a", borderWidth: 2, borderColor: "#8b5fe0" },
   avatar: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#33224d", borderWidth: 2, borderColor: "#111329" },
   avatarPulse: { position: "absolute", top: 2, right: 2, width: 8, height: 8, borderRadius: 4, borderWidth: 1, borderColor: "#d1b6ff", backgroundColor: "#74d7ff" },
   avatarImage: { width: "100%", height: "100%" }, avatarInitials: { color: "#e6d9ff", fontWeight: "700", fontSize: 16 },
   profileHero: { flexDirection: "row", alignItems: "center", gap: 17, marginBottom: 12, paddingVertical: 8 },
+  profileAvatarWrap: { position: "relative" },
+  avatarUploadButton: { position: "absolute", right: 0, bottom: 0, width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: "#8b35ff", borderWidth: 2, borderColor: "#070713", shadowColor: "#8b35ff", shadowOpacity: 0.35, shadowRadius: 7, shadowOffset: { width: 0, height: 2 }, elevation: 4 },
+  avatarUploadText: { color: "#fff", fontSize: 25, lineHeight: 29, fontWeight: "500" },
   unreadNotification: { borderLeftWidth: 3, borderLeftColor: "#7da99e", paddingLeft: 12, backgroundColor: "#20212c" },
   relationshipRow: { borderBottomWidth: 1, borderBottomColor: "#373447", paddingVertical: 10 },
   postBody: { color: "#e7e1eb", fontSize: 15, lineHeight: 23, marginVertical: 12 },
+  disclosure: { borderWidth: 1, borderColor: "#373447", borderRadius: 14, backgroundColor: "#111329", marginVertical: 6, overflow: "hidden" },
+  disclosureTrigger: { minHeight: 54, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 15, paddingVertical: 10 },
+  disclosureTitle: { color: "#eee7f8", fontSize: 16, fontWeight: "700", flexShrink: 1 },
+  disclosureIcon: { color: "#d2b7ff", fontSize: 24, lineHeight: 28, paddingHorizontal: 5 },
+  disclosureContent: { borderTopWidth: 1, borderTopColor: "#302a44", padding: 13 },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, row: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 7, marginVertical: 5 },
   link: { color: "#c2a8ff", fontWeight: "700", padding: 8 },
   empty: { alignItems: "center", borderWidth: 1, borderStyle: "solid", borderColor: "#494252", borderRadius: 18, padding: 24, marginVertical: 20, backgroundColor: "#191b29" },
   error: { padding: 12, backgroundColor: "#39242f", borderColor: "#805568", borderWidth: 1, borderRadius: 12, marginBottom: 12 }, errorText: { color: "#ffd1dc" },
   checkLine: { padding: 13, marginVertical: 5, backgroundColor: "#191b29", borderRadius: 12, borderWidth: 1, borderColor: "#403b4b" },
-  messageList: { minHeight: 180, maxHeight: 420, backgroundColor: "#151724", padding: 12, borderRadius: 16, borderWidth: 1, borderColor: "#373447", marginVertical: 12 },
-  message: { alignSelf: "flex-start", maxWidth: "86%", padding: 12, backgroundColor: "#292536", borderRadius: 15, marginVertical: 5 },
+  messageList: { height: 360, minHeight: 180, backgroundColor: "#151724", padding: 12, borderRadius: 16, borderWidth: 1, borderColor: "#373447", marginVertical: 12 },
+  conversationDate: { color: "#cbb9e7", fontSize: 12, fontWeight: "700", textAlign: "center", marginBottom: 9 },
+  messageScroll: { flex: 1 },
+  messageScrollContent: { paddingBottom: 6, flexGrow: 1 },
+  loadOlderButton: { minHeight: 44, alignItems: "center", justifyContent: "center", padding: 8, marginBottom: 7, borderRadius: 11, backgroundColor: "#211a31", borderWidth: 1, borderColor: "#493b63" },
+  loadOlderText: { color: "#d7c4f4", fontWeight: "700" },
+  message: { alignSelf: "flex-start", maxWidth: "92%", padding: 12, backgroundColor: "#292536", borderRadius: 15, marginVertical: 5 },
   myMessage: { alignSelf: "flex-end", backgroundColor: "#233b39" },
   messageAuthor: { color: "#d4c7dc", fontSize: 12, fontWeight: "700", marginBottom: 3 },
+  messageBody: { color: "#e7e1eb", lineHeight: 21, flexShrink: 1 },
+  messageTime: { color: "#b1a7be", fontSize: 10, marginTop: 7, alignSelf: "flex-end" },
   replyThread: { borderTopWidth: 1, borderTopColor: "#373447", marginTop: 12, paddingTop: 10 },
   replyCard: { width: "100%", borderWidth: 1, borderColor: "#403b4b", borderRadius: 14, backgroundColor: "#1d1f2c", padding: 13, marginVertical: 7 },
   quotedItem: { borderWidth: 1, borderColor: "#51495a", borderRadius: 12, padding: 12, marginVertical: 8, backgroundColor: "#151722" },
@@ -1220,7 +1729,10 @@ const styles = StyleSheet.create({
   memberRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#373447" },
   memberIdentity: { flex: 1, minWidth: 0 },
   threadRow: { flexDirection: "row", alignItems: "center", gap: 12, padding: 13, marginVertical: 4, borderWidth: 1, borderColor: "#373447", borderRadius: 14, backgroundColor: "#191b29" },
+  threadOpen: { minHeight: 40, justifyContent: "center", alignSelf: "flex-start", paddingHorizontal: 8 },
+  threadOpenText: { color: "#d4bcff", fontSize: 13, fontWeight: "700" },
   startConversation: { padding: 13, marginVertical: 12, borderWidth: 1, borderColor: "#373447", borderRadius: 15, backgroundColor: "#191b29" },
-  countCard: { minWidth: 120, flex: 1, padding: 14, borderRadius: 14, borderWidth: 1, borderColor: "#403b4b", backgroundColor: "#191b29" },
-  countValue: { color: "#f4eff7", fontSize: 21, fontWeight: "700" },
+  countCard: { minWidth: 72, flex: 1, padding: 10, borderRadius: 12, borderWidth: 1, borderColor: "#403b4b", backgroundColor: "#191b29" },
+  countValue: { color: "#f4eff7", fontSize: 19, fontWeight: "700" },
+  countLabel: { color: "#aaa7c7", fontSize: 12, marginTop: 2 },
 });

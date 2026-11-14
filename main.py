@@ -44,6 +44,7 @@ OTP_IP_LIMIT = 20
 OTP_RATE_WINDOW = 60 * 60
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,24}$")
+MENTION_RE = re.compile(r"(?<![A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])")
 PASSWORD_RE = re.compile(r"^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9\s])")
 DB = Database()
 LOGGER = logging.getLogger("zorlii.recovery")
@@ -454,7 +455,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                    user_id,actor_id,kind,post_id,reply_id,conversation_id,activity_kind
                ) VALUES(?,?,?,?,?,?,?)""",
             (user_id, actor_id, "reaction" if kind in {"repost", "reply_reaction", "reply_repost"} else
-             "reply" if kind in {"quote", "message"} else kind,
+             "reply" if kind in {"quote", "message", "mention"} else kind,
              post_id, reply_id, conversation_id, kind),
         )
         return cursor.lastrowid
@@ -655,6 +656,32 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 for item in media
             ],
         }
+
+    def add_mentions(connection, body, actor_id, post_id, reply_id=None):
+        recipients = []
+        for username in {match.group(1).lower() for match in MENTION_RE.finditer(body)}:
+            target = connection.execute(
+                "SELECT id FROM users WHERE username=?", (username,),
+            ).fetchone()
+            if target is None or target["id"] == actor_id:
+                continue
+            visible = (
+                visible_reply(connection, reply_id, target["id"])
+                if reply_id is not None
+                else visible_post(connection, post_id, target["id"], include_quote=False)
+            )
+            if visible is not None:
+                add_activity(connection, target["id"], actor_id, "mention", post_id=post_id, reply_id=reply_id)
+                recipients.append(target["id"])
+        return recipients
+
+    def push_mentions(background_tasks, recipients, username, post_id, reply_id=None):
+        for recipient_id in recipients:
+            schedule_push(
+                background_tasks, recipient_id, "New mention",
+                f"@{username} mentioned you.",
+                {"screen": "activities", "post_id": post_id, "reply_id": reply_id},
+            )
 
     def validate_quote_target(connection, user_id, quoted_post_id, quoted_reply_id, quote_visibility):
         if quoted_post_id and quoted_reply_id:
@@ -1265,7 +1292,24 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     @app.get("/api/me")
     def me(user: User):
-        return {"user": db.profile_for(user["id"])}
+        profile = db.profile_for(user["id"])
+        with db.locked_connection() as connection:
+            counts = connection.execute(
+                """SELECT
+                   (SELECT COUNT(*) FROM posts WHERE user_id=?) AS posts,
+                   (SELECT COUNT(*) FROM post_media m JOIN posts p ON p.id=m.post_id WHERE p.user_id=?)
+                     + (SELECT COUNT(*) FROM reply_media m JOIN replies r ON r.id=m.reply_id WHERE r.user_id=?) AS media,
+                   (SELECT COUNT(*) FROM replies WHERE user_id=?) AS replies,
+                   (SELECT COUNT(*) FROM reactions WHERE user_id=?)
+                     + (SELECT COUNT(*) FROM reply_reactions WHERE user_id=?) AS likes,
+                   (SELECT COUNT(*) FROM post_reposts WHERE user_id=?)
+                     + (SELECT COUNT(*) FROM reply_reposts WHERE user_id=?) AS echoes,
+                   (SELECT COUNT(*) FROM bookmarks WHERE user_id=?) AS saved,
+                   (SELECT COUNT(*) FROM messages WHERE sender_id=?) AS messages""",
+                (user["id"],) * 10,
+            ).fetchone()
+        profile["activity_counts"] = dict(counts)
+        return {"user": profile}
 
     @app.get("/api/profile")
     def profile(user: User):
@@ -1457,7 +1501,12 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         return {"user": result}
 
     @app.get("/api/users/{username}/posts")
-    def profile_posts(username: str, user: User, limit: int = Query(default=30, ge=1, le=100)):
+    def profile_posts(
+        username: str,
+        user: User,
+        limit: int = Query(default=30, ge=1, le=100),
+        before_id: int | None = Query(default=None, ge=1),
+    ):
         with db.locked_connection() as connection:
             target = connection.execute("SELECT id FROM users WHERE username=?", (username.lower().lstrip("@"),)).fetchone()
             if target is None:
@@ -1465,19 +1514,20 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             if target["id"] != user["id"] and is_blocked(connection, user["id"], target["id"]):
                 raise HTTPException(status_code=404, detail="Profile not found.")
             ids = connection.execute(
-                """SELECT p.id FROM posts p WHERE p.user_id=? AND
+                """SELECT p.id FROM posts p WHERE p.user_id=? AND (? IS NULL OR p.id<?) AND
                    (p.user_id=? OR p.visibility='public' OR
                     (p.visibility='followers' AND EXISTS(
                        SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id)))
                    ORDER BY p.id DESC LIMIT ?""",
-                (target["id"], user["id"], user["id"], limit),
+                (target["id"], before_id, before_id, user["id"], user["id"], limit + 1),
             ).fetchall()
+            has_more = len(ids) > limit
             posts = []
-            for item in ids:
+            for item in ids[:limit]:
                 row = visible_post(connection, item["id"], user["id"])
                 if row is not None:
                     posts.append(post_payload(row))
-        return {"posts": posts}
+        return {"posts": posts, "has_more": has_more}
 
     def relationship_list(username, relationship, limit, offset, user_id):
         target_column = "followed_id" if relationship == "followers" else "follower_id"
@@ -1722,7 +1772,9 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                     connection, quote_target["user_id"], user["id"], "quote",
                     post_id=quote_target["post_id"], reply_id=quote_target["reply_id"],
                 )
+            mentioned = add_mentions(connection, data.body, user["id"], post_id)
             row = visible_post(connection, post_id, user["id"])
+        push_mentions(background_tasks, mentioned, user["username"], post_id)
         if quote_target:
             schedule_push(
                 background_tasks, quote_target["user_id"], "New quote",
@@ -1808,12 +1860,14 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                             connection, quote_target["user_id"], user["id"], "quote",
                             post_id=quote_target["post_id"], reply_id=quote_target["reply_id"],
                         )
+                    mentioned = add_mentions(connection, data.body, user["id"], post_id)
                     row = visible_post(connection, post_id, user["id"])
                 completed = True
             finally:
                 if not completed:
                     for item in stored_media:
                         (media_dir / item["filename"]).unlink(missing_ok=True)
+            push_mentions(background_tasks, mentioned, user["username"], post_id)
             if quote_target:
                 schedule_push(
                     background_tasks, quote_target["user_id"], "New quote",
@@ -1953,7 +2007,9 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             )
             reply_id = cursor.lastrowid
             add_activity(connection, post["user_id"], user["id"], "reply", post_id=post_id, reply_id=reply_id)
+            mentioned = add_mentions(connection, data.body, user["id"], post_id, reply_id)
             reply = visible_reply(connection, reply_id, user["id"])
+        push_mentions(background_tasks, mentioned, user["username"], post_id, reply_id)
         if post["user_id"] != user["id"]:
             schedule_push(
                 background_tasks, post["user_id"], "New reply",
@@ -2033,12 +2089,14 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                         connection, post["user_id"], user["id"], "reply",
                         post_id=post_id, reply_id=reply_id,
                     )
+                    mentioned = add_mentions(connection, data.body, user["id"], post_id, reply_id)
                     reply = visible_reply(connection, reply_id, user["id"])
                 completed = True
             finally:
                 if not completed:
                     for item in stored_media:
                         (media_dir / item["filename"]).unlink(missing_ok=True)
+            push_mentions(background_tasks, mentioned, user["username"], post_id, reply_id)
             if post["user_id"] != user["id"]:
                 schedule_push(
                     background_tasks, post["user_id"], "New reply",
@@ -2295,7 +2353,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 ).fetchall()
                 if participants and is_blocked(connection, user["id"], participants[0]["id"]):
                     continue
-                result.append({"id": row["id"], "last_message": row["last_message"],
+                result.append({"id": row["id"], "created_at": row["created_at"], "last_message": row["last_message"],
                                "last_message_at": row["last_message_at"], "participants": [
                                    {
                                        "id": p["id"], "username": p["username"], "display_name": p["display_name"],
@@ -2350,16 +2408,27 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         return other["user_id"] if other else None
 
     @app.get("/api/conversations/{conversation_id}/messages")
-    def list_messages(conversation_id: int, user: User, limit: int = Query(default=100, ge=1, le=100)):
+    def list_messages(
+        conversation_id: int,
+        user: User,
+        limit: int = Query(default=100, ge=1, le=100),
+        before_id: int | None = Query(default=None, ge=1),
+    ):
         with db.locked_connection() as connection:
             require_conversation_participant(connection, conversation_id, user["id"])
+            conversation = connection.execute(
+                "SELECT created_at FROM conversations WHERE id=?", (conversation_id,),
+            ).fetchone()
             rows = connection.execute(
                 """SELECT m.id,m.body,m.created_at,m.sender_id,u.username,p.display_name,p.avatar_filename
                    FROM messages m JOIN users u ON u.id=m.sender_id JOIN profiles p ON p.user_id=u.id
-                   WHERE m.conversation_id=? ORDER BY m.id DESC LIMIT ?""",
-                (conversation_id, limit),
+                   WHERE m.conversation_id=? AND (? IS NULL OR m.id<?)
+                   ORDER BY m.id DESC LIMIT ?""",
+                (conversation_id, before_id, before_id, limit + 1),
             ).fetchall()
-        return {"messages": [
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        return {"conversation_created_at": conversation["created_at"], "has_more": has_more, "messages": [
             {"id": r["id"], "body": r["body"], "created_at": r["created_at"], "sender_id": r["sender_id"],
              "author": {
                  "username": r["username"], "display_name": r["display_name"],
