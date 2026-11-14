@@ -12,8 +12,10 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated
+from urllib.error import URLError
+from urllib.request import Request as URLRequest, urlopen
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -47,6 +49,8 @@ DB = Database()
 LOGGER = logging.getLogger("zorlii.recovery")
 OTP_GENERIC_MESSAGE = "If the details can be verified, a one-time code may be sent. This response does not confirm delivery."
 PASSWORD_POLICY_MESSAGE = "Password must be 4–128 characters and include an uppercase letter, a lowercase letter, a number, and a special character."
+EXPO_PUSH_ENDPOINT = "https://exp.host/--/api/v2/push/send"
+PUSH_LOGGER = logging.getLogger("zorlii.push")
 AVATAR_MAX_BYTES = 50 * 1024 * 1024
 AVATAR_MAX_DIMENSION = 4096
 AVATAR_MAX_PIXELS = 16_000_000
@@ -140,6 +144,7 @@ class RegisterInput(BaseModel):
     username: str = Field(min_length=3, max_length=24)
     password: str = Field(min_length=4, max_length=128)
     display_name: str = Field(min_length=1, max_length=60)
+    accept_terms: bool = False
 
     @field_validator("email")
     @classmethod
@@ -215,6 +220,39 @@ class AccountDeleteInput(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+class TermsAcceptInput(BaseModel):
+    accepted: bool
+
+
+class ReportInput(BaseModel):
+    target_type: str = Field(pattern="^(post|user)$")
+    target_id: int = Field(gt=0)
+    reason: str = Field(pattern="^(harassment|hate|sexual|spam|self_harm|other)$")
+    details: str = Field(default="", max_length=1000)
+
+    @field_validator("details")
+    @classmethod
+    def trim_details(cls, value):
+        return value.strip()
+
+class MediaReplyInput(BaseModel):
+    body: str = Field(default="", max_length=4000)
+
+    @field_validator("body")
+    @classmethod
+    def trim_body(cls, value):
+        return value.strip()
+
+
+class PushTokenInput(BaseModel):
+    token: str = Field(pattern=r"^(Expo|Exponent)PushToken\[[A-Za-z0-9_-]{10,200}\]$", max_length=220)
+    platform: str = Field(pattern="^(ios|android)$")
+
+
+class ReportStatusInput(BaseModel):
+    status: str = Field(pattern="^(reviewed|actioned|dismissed)$")
+
+
 class ProfileUpdate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     display_name: str | None = Field(default=None, min_length=1, max_length=60)
@@ -239,20 +277,22 @@ class ProfileUpdate(BaseModel):
 
 
 class PostInput(BaseModel):
-    body: str = Field(min_length=1, max_length=5000)
+    body: str = Field(default="", max_length=5000)
     visibility: str = Field(default="public", pattern="^(public|followers|private)$")
+    quoted_post_id: int | None = Field(default=None, gt=0)
+    quoted_reply_id: int | None = Field(default=None, gt=0)
 
     @field_validator("body")
     @classmethod
     def non_whitespace(cls, value):
-        if not value.strip():
-            raise ValueError("Post text cannot be blank.")
         return value.strip()
 
 
 class MediaPostInput(BaseModel):
     body: str = Field(default="", max_length=5000)
     visibility: str = Field(default="public", pattern="^(public|followers|private)$")
+    quoted_post_id: int | None = Field(default=None, gt=0)
+    quoted_reply_id: int | None = Field(default=None, gt=0)
 
     @field_validator("body")
     @classmethod
@@ -346,6 +386,20 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
     def index():
         return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
 
+    legal_dir = Path(__file__).with_name("legal")
+
+    @app.get("/privacy", include_in_schema=False)
+    def privacy_policy():
+        return FileResponse(legal_dir / "privacy.html")
+
+    @app.get("/terms", include_in_schema=False)
+    def terms_of_use():
+        return FileResponse(legal_dir / "terms.html")
+
+    @app.get("/account-deletion", include_in_schema=False)
+    def account_deletion_info():
+        return FileResponse(legal_dir / "account-deletion.html")
+
     def authenticated_user(request: Request):
         authorization = request.headers.get("authorization", "")
         token = None
@@ -367,20 +421,120 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     User = Annotated[dict, Depends(authenticated_user)]
 
-    def visible_post(connection, post_id, viewer_id):
+    def require_terms_accepted(user_id):
+        with db.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT terms_accepted_at FROM profiles WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+        if row is None or not row["terms_accepted_at"]:
+            raise HTTPException(status_code=403, detail="Accept the Terms of Use before contributing content.")
+
+    def is_blocked(connection, user_id, other_user_id):
+        return bool(connection.execute(
+            """SELECT 1 FROM blocked_users
+               WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)""",
+            (user_id, other_user_id, other_user_id, user_id),
+        ).fetchone())
+
+    def require_moderator(user):
+        moderators = {
+            email.strip().lower()
+            for email in os.environ.get("ZORLII_MODERATOR_EMAILS", "").split(",")
+            if email.strip()
+        }
+        if user["email"].lower() not in moderators:
+            raise HTTPException(status_code=403, detail="Moderator access is required.")
+
+    def add_activity(connection, user_id, actor_id, kind, post_id=None, reply_id=None, conversation_id=None):
+        if user_id == actor_id:
+            return None
+        cursor = connection.execute(
+            """INSERT INTO notifications(
+                   user_id,actor_id,kind,post_id,reply_id,conversation_id,activity_kind
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (user_id, actor_id, "reaction" if kind in {"repost", "reply_reaction", "reply_repost"} else
+             "reply" if kind in {"quote", "message"} else kind,
+             post_id, reply_id, conversation_id, kind),
+        )
+        return cursor.lastrowid
+
+    def send_push_notification(user_id, title, body, data):
+        with db.locked_connection() as connection:
+            tokens = [row["token"] for row in connection.execute(
+                "SELECT token FROM push_tokens WHERE user_id=?", (user_id,)
+            ).fetchall()]
+        if not tokens:
+            return
+        payload = [
+            {"to": token, "title": title, "body": body, "sound": "default", "data": data}
+            for token in tokens
+        ]
+        request = URLRequest(
+            EXPO_PUSH_ENDPOINT,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "Zorlii/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (URLError, OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            PUSH_LOGGER.warning(
+                "Expo push request failed (error_type=%s)",
+                type(error).__name__,
+            )
+            return
+        if not isinstance(result, dict):
+            PUSH_LOGGER.error("Expo push response was not a JSON object")
+            return
+        tickets = result.get("data", [])
+        if not isinstance(tickets, list):
+            PUSH_LOGGER.error("Expo push response did not contain a ticket list")
+            return
+        dead_tokens = [
+            tokens[index] for index, ticket in enumerate(tickets)
+            if index < len(tokens)
+            and isinstance(ticket, dict)
+            and ticket.get("status") == "error"
+            and (ticket.get("details") or {}).get("error") == "DeviceNotRegistered"
+        ]
+        if dead_tokens:
+            with db.transaction() as connection:
+                connection.executemany("DELETE FROM push_tokens WHERE token=?", [(token,) for token in dead_tokens])
+        errors = sum(
+            isinstance(ticket, dict) and ticket.get("status") == "error"
+            for ticket in tickets
+        )
+        if errors:
+            PUSH_LOGGER.warning("Expo push delivery returned %d error ticket(s)", errors)
+
+    def schedule_push(background_tasks, user_id, title, body, data):
+        background_tasks.add_task(send_push_notification, user_id, title, body, data)
+
+    def visible_post(connection, post_id, viewer_id, include_quote=True):
         row = connection.execute(
             """SELECT p.*, u.username, pr.display_name, pr.bio,
                       pr.avatar_filename,
                       (SELECT COUNT(*) FROM replies r WHERE r.post_id=p.id) AS reply_count,
                       (SELECT COUNT(*) FROM reactions x WHERE x.post_id=p.id) AS reaction_count,
+                      (SELECT COUNT(*) FROM post_reposts rr WHERE rr.post_id=p.id) AS repost_count,
                       EXISTS(SELECT 1 FROM reactions x WHERE x.post_id=p.id AND x.user_id=?) AS reacted,
                       EXISTS(SELECT 1 FROM bookmarks b WHERE b.post_id=p.id AND b.user_id=?) AS bookmarked,
+                      EXISTS(SELECT 1 FROM post_reposts rr WHERE rr.post_id=p.id AND rr.user_id=?) AS reposted,
+                      EXISTS(SELECT 1 FROM reply_reposts rr WHERE rr.share_post_id=p.id) AS reposted_reply,
                       EXISTS(SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id) AS followed
                FROM posts p JOIN users u ON u.id=p.user_id JOIN profiles pr ON pr.user_id=u.id
                WHERE p.id=?""",
-            (viewer_id, viewer_id, viewer_id, post_id),
+            (viewer_id, viewer_id, viewer_id, viewer_id, post_id),
         ).fetchone()
         if row is None:
+            return None
+        if row["user_id"] != viewer_id and is_blocked(connection, viewer_id, row["user_id"]):
             return None
         if row["user_id"] != viewer_id:
             if row["visibility"] == "private":
@@ -397,6 +551,24 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             {"id": item["id"], "media_type": item["media_type"], "url": f"/api/post-media/{item['id']}"}
             for item in media
         ]
+        if include_quote and result.get("quoted_post_id"):
+            quoted = visible_post(connection, result["quoted_post_id"], viewer_id, include_quote=False)
+            result["quoted_post"] = post_payload(quoted) if quoted else None
+        if include_quote and result.get("quoted_reply_id"):
+            result["quoted_reply"] = visible_reply(connection, result["quoted_reply_id"], viewer_id)
+        repost_row = connection.execute(
+            """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
+               FROM post_reposts rr JOIN users u ON u.id=rr.user_id
+               JOIN profiles p ON p.user_id=u.id
+               WHERE rr.post_id=? AND (rr.user_id=? OR EXISTS(
+                   SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=rr.user_id))
+                 AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                   WHERE (b.blocker_id=? AND b.blocked_id=rr.user_id)
+                      OR (b.blocker_id=rr.user_id AND b.blocked_id=?))
+               ORDER BY rr.created_at DESC LIMIT 1""",
+            (post_id, viewer_id, viewer_id, viewer_id, viewer_id),
+        ).fetchone()
+        result["reposted_by"] = public_user(repost_row) if repost_row else None
         return result
 
     def post_payload(row):
@@ -417,10 +589,107 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             },
             "reply_count": row["reply_count"],
             "reaction_count": row["reaction_count"],
+            "repost_count": row["repost_count"],
             "reacted": bool(row["reacted"]),
             "bookmarked": bool(row["bookmarked"]),
+            "reposted": bool(row["reposted"]),
+            "reposted_reply": bool(row["reposted_reply"]),
+            "reposted_by": row.get("reposted_by"),
             "media": row.get("media", []),
+            "quoted_post": row.get("quoted_post"),
+            "quoted_reply": row.get("quoted_reply"),
         }
+
+    def visible_reply(connection, reply_id, viewer_id):
+        row = connection.execute(
+            """SELECT r.id,r.post_id,r.user_id,r.body,r.created_at,u.username,
+                      p.display_name,p.bio,p.avatar_filename,
+                      (SELECT COUNT(*) FROM reply_reactions x WHERE x.reply_id=r.id) AS reaction_count,
+                      (SELECT COUNT(*) FROM reply_reposts rr WHERE rr.reply_id=r.id) AS repost_count,
+                      EXISTS(SELECT 1 FROM reply_reactions x WHERE x.reply_id=r.id AND x.user_id=?) AS reacted,
+                      EXISTS(SELECT 1 FROM reply_reposts rr WHERE rr.reply_id=r.id AND rr.user_id=?) AS reposted
+               FROM replies r JOIN users u ON u.id=r.user_id JOIN profiles p ON p.user_id=u.id
+               WHERE r.id=?""",
+            (viewer_id, viewer_id, reply_id),
+        ).fetchone()
+        if row is None or visible_post(connection, row["post_id"], viewer_id, include_quote=False) is None:
+            return None
+        if row["user_id"] != viewer_id and is_blocked(connection, viewer_id, row["user_id"]):
+            return None
+        media = connection.execute(
+            "SELECT id,media_type FROM reply_media WHERE reply_id=? ORDER BY position,id",
+            (reply_id,),
+        ).fetchall()
+        repost_row = connection.execute(
+            """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
+               FROM reply_reposts rr JOIN users u ON u.id=rr.user_id
+               JOIN profiles p ON p.user_id=u.id
+               WHERE rr.reply_id=? AND (rr.user_id=? OR EXISTS(
+                   SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=rr.user_id))
+                 AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                   WHERE (b.blocker_id=? AND b.blocked_id=rr.user_id)
+                      OR (b.blocker_id=rr.user_id AND b.blocked_id=?))
+               ORDER BY rr.created_at DESC LIMIT 1""",
+            (reply_id, viewer_id, viewer_id, viewer_id, viewer_id),
+        ).fetchone()
+        return {
+            "id": row["id"],
+            "post_id": row["post_id"],
+            "body": row["body"],
+            "created_at": row["created_at"],
+            "author": {
+                "id": row["user_id"],
+                "username": row["username"],
+                "display_name": row["display_name"],
+                "bio": row["bio"],
+                "avatar_url": f"/api/avatars/{row['user_id']}?v={row['avatar_filename'][:8]}"
+                if row["avatar_filename"] else None,
+            },
+            "reaction_count": row["reaction_count"],
+            "repost_count": row["repost_count"],
+            "reacted": bool(row["reacted"]),
+            "reposted": bool(row["reposted"]),
+            "reposted_by": public_user(repost_row) if repost_row else None,
+            "media": [
+                {"id": item["id"], "media_type": item["media_type"], "url": f"/api/reply-media/{item['id']}"}
+                for item in media
+            ],
+        }
+
+    def validate_quote_target(connection, user_id, quoted_post_id, quoted_reply_id, quote_visibility):
+        if quoted_post_id and quoted_reply_id:
+            raise HTTPException(status_code=422, detail="Choose one item to quote.")
+        if quoted_post_id:
+            target = visible_post(connection, quoted_post_id, user_id, include_quote=False)
+            if target is None:
+                raise HTTPException(status_code=404, detail="The quoted post is not available.")
+            if target["visibility"] != "public" and quote_visibility != "private":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only public posts can be quoted to other members.",
+                )
+            return {"user_id": target["user_id"], "post_id": quoted_post_id, "reply_id": None}
+        if quoted_reply_id:
+            target = visible_reply(connection, quoted_reply_id, user_id)
+            if target is None:
+                raise HTTPException(status_code=404, detail="The quoted reply is not available.")
+            reply = connection.execute(
+                """SELECT r.user_id,r.post_id,p.visibility
+                   FROM replies r JOIN posts p ON p.id=r.post_id WHERE r.id=?""",
+                (quoted_reply_id,),
+            ).fetchone()
+            if reply["visibility"] != "public" and quote_visibility != "private":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Replies to non-public posts can only be quoted privately.",
+                )
+            return {
+                "user_id": reply["user_id"],
+                "post_id": reply["post_id"],
+                "reply_id": quoted_reply_id,
+            }
+        return None
+
 
     @app.get("/api/health")
     def health():
@@ -430,6 +699,40 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         except (EmailConfigurationError, ValueError):
             email = "not_configured"
         return {"status": "ok", "email": email}
+
+    @app.post("/api/push-token", status_code=204)
+    def register_push_token(data: PushTokenInput, user: User):
+        with db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO push_tokens(token,user_id,platform)
+                   VALUES(?,?,?)
+                   ON CONFLICT(token) DO UPDATE SET
+                       user_id=excluded.user_id,platform=excluded.platform,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (data.token, user["id"], data.platform),
+            )
+        return Response(status_code=204)
+
+    @app.delete("/api/push-token", status_code=204)
+    def unregister_push_token(data: PushTokenInput, user: User):
+        with db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM push_tokens WHERE token=? AND user_id=?",
+                (data.token, user["id"]),
+            )
+        return Response(status_code=204)
+
+    @app.post("/api/terms/accept")
+    def accept_terms(data: TermsAcceptInput, user: User):
+        if not data.accepted:
+            raise HTTPException(status_code=422, detail="You must accept the Terms of Use.")
+        with db.transaction() as connection:
+            connection.execute(
+                """UPDATE profiles SET terms_accepted_at=COALESCE(terms_accepted_at,CURRENT_TIMESTAMP),
+                   updated_at=CURRENT_TIMESTAMP WHERE user_id=?""",
+                (user["id"],),
+            )
+        return {"user": db.profile_for(user["id"])}
 
     @app.get("/api/avatars/{user_id}")
     def get_avatar(user_id: int):
@@ -477,8 +780,34 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             },
         )
 
+    @app.get("/api/reply-media/{media_id}")
+    def get_reply_media(media_id: int, user: User):
+        with db.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT filename,media_type,reply_id FROM reply_media WHERE id=?",
+                (media_id,),
+            ).fetchone()
+            if row is None or visible_reply(connection, row["reply_id"], user["id"]) is None:
+                raise HTTPException(status_code=404, detail="Media not found.")
+        if row["media_type"] not in POST_MEDIA_TYPES or not re.fullmatch(
+            r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", row["filename"]
+        ):
+            raise HTTPException(status_code=404, detail="Media not found.")
+        path = media_dir / row["filename"]
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Media not found.")
+        return FileResponse(
+            path,
+            media_type=row["media_type"],
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @app.put("/api/profile/avatar")
     async def upload_avatar(request: Request, user: User):
+        require_terms_accepted(user["id"])
         request_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if request_type not in AVATAR_TYPES and request_type not in {"application/json", "multipart/form-data", "application/octet-stream"}:
             raise HTTPException(status_code=415, detail="This image could not be uploaded.")
@@ -734,6 +1063,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     @app.post("/api/auth/register", status_code=202)
     def register(data: RegisterInput, request: Request):
+        if not data.accept_terms:
+            raise HTTPException(status_code=422, detail="Accept the Terms of Use to create an account.")
         return issue_otp(
             "register",
             data.email,
@@ -819,7 +1150,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                         )
                         user_id = cursor.lastrowid
                         connection.execute(
-                            "INSERT INTO profiles(user_id,display_name) VALUES(?,?)",
+                            """INSERT INTO profiles(user_id,display_name,terms_accepted_at)
+                               VALUES(?,?,CURRENT_TIMESTAMP)""",
                             (user_id, challenge["display_name"]),
                         )
                         token = new_session_token()
@@ -1051,12 +1383,25 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             ).fetchone()
             media_rows = connection.execute(
                 """SELECT pm.filename FROM post_media pm
-                   JOIN posts p ON p.id=pm.post_id WHERE p.user_id=?""",
-                (user["id"],),
+                   JOIN posts p ON p.id=pm.post_id WHERE p.user_id=?
+                   UNION ALL
+                   SELECT rm.filename FROM reply_media rm JOIN replies r ON r.id=rm.reply_id
+                   WHERE r.user_id=? OR r.post_id IN (SELECT id FROM posts WHERE user_id=?)""",
+                (user["id"], user["id"], user["id"]),
             ).fetchall()
         if row is None or not verify_password(data.password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="Password is incorrect.")
         with db.transaction() as connection:
+            connection.execute(
+                """DELETE FROM posts WHERE id IN (
+                       SELECT rr.share_post_id FROM reply_reposts rr
+                       JOIN replies r ON r.id=rr.reply_id
+                       WHERE r.user_id=? OR r.post_id IN (
+                           SELECT id FROM posts WHERE user_id=?
+                       )
+                   )""",
+                (user["id"], user["id"]),
+            )
             connection.execute("DELETE FROM users WHERE id=?", (user["id"],))
             connection.execute(
                 """DELETE FROM conversations WHERE NOT EXISTS(
@@ -1074,6 +1419,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     @app.patch("/api/profile")
     def update_profile(data: ProfileUpdate, user: User):
+        require_terms_accepted(user["id"])
         changes = data.model_dump(exclude_unset=True)
         if changes:
             if "interests" in changes:
@@ -1096,6 +1442,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             ).fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Profile not found.")
+            if row["id"] != user["id"] and is_blocked(connection, user["id"], row["id"]):
+                raise HTTPException(status_code=404, detail="Profile not found.")
             result = public_user(row)
             result["following"] = bool(connection.execute(
                 "SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?", (user["id"], row["id"])
@@ -1114,6 +1462,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             target = connection.execute("SELECT id FROM users WHERE username=?", (username.lower().lstrip("@"),)).fetchone()
             if target is None:
                 raise HTTPException(status_code=404, detail="Profile not found.")
+            if target["id"] != user["id"] and is_blocked(connection, user["id"], target["id"]):
+                raise HTTPException(status_code=404, detail="Profile not found.")
             ids = connection.execute(
                 """SELECT p.id FROM posts p WHERE p.user_id=? AND
                    (p.user_id=? OR p.visibility='public' OR
@@ -1129,7 +1479,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                     posts.append(post_payload(row))
         return {"posts": posts}
 
-    def relationship_list(username, relationship, limit, offset):
+    def relationship_list(username, relationship, limit, offset, user_id):
         target_column = "followed_id" if relationship == "followers" else "follower_id"
         source_column = "follower_id" if relationship == "followers" else "followed_id"
         with db.locked_connection() as connection:
@@ -1139,17 +1489,26 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             ).fetchone()
             if target is None:
                 raise HTTPException(status_code=404, detail="Profile not found.")
+            if target["id"] != user_id and is_blocked(connection, user_id, target["id"]):
+                raise HTTPException(status_code=404, detail="Profile not found.")
             total = connection.execute(
-                f"SELECT COUNT(*) FROM follows WHERE {target_column}=?",
-                (target["id"],),
+                f"""SELECT COUNT(*) FROM follows f JOIN users u ON u.id=f.{source_column}
+                    WHERE f.{target_column}=?
+                      AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                          WHERE (b.blocker_id=? AND b.blocked_id=u.id)
+                             OR (b.blocker_id=u.id AND b.blocked_id=?))""",
+                (target["id"], user_id, user_id),
             ).fetchone()[0]
             rows = connection.execute(
                 f"""SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
                     FROM follows f JOIN users u ON u.id=f.{source_column}
                     JOIN profiles p ON p.user_id=u.id
                     WHERE f.{target_column}=?
+                      AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                          WHERE (b.blocker_id=? AND b.blocked_id=u.id)
+                             OR (b.blocker_id=u.id AND b.blocked_id=?))
                     ORDER BY f.created_at DESC,u.id DESC LIMIT ? OFFSET ?""",
-                (target["id"], limit, offset),
+                (target["id"], user_id, user_id, limit, offset),
             ).fetchall()
         return {"users": [public_user(row) for row in rows], "count": total, "limit": limit, "offset": offset}
 
@@ -1160,7 +1519,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         limit: int = Query(default=30, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
     ):
-        return relationship_list(username, "followers", limit, offset)
+        return relationship_list(username, "followers", limit, offset, user["id"])
 
     @app.get("/api/users/{username}/following")
     def list_following(
@@ -1169,16 +1528,160 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         limit: int = Query(default=30, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
     ):
-        return relationship_list(username, "following", limit, offset)
+        return relationship_list(username, "following", limit, offset, user["id"])
+
+    @app.get("/api/blocks")
+    def list_blocked_users(user: User):
+        with db.locked_connection() as connection:
+            rows = connection.execute(
+                """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
+                   FROM blocked_users b JOIN users u ON u.id=b.blocked_id
+                   JOIN profiles p ON p.user_id=u.id
+                   WHERE b.blocker_id=? ORDER BY b.created_at DESC,u.id DESC""",
+                (user["id"],),
+            ).fetchall()
+        return {"users": [public_user(row) for row in rows]}
+
+    @app.post("/api/users/{username}/block")
+    def toggle_block(username: str, user: User):
+        with db.transaction() as connection:
+            target = connection.execute(
+                "SELECT id FROM users WHERE lower(username)=?",
+                (username.lower().lstrip("@"),),
+            ).fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Profile not found.")
+            if target["id"] == user["id"]:
+                raise HTTPException(status_code=400, detail="You cannot block yourself.")
+            existing = connection.execute(
+                "SELECT 1 FROM blocked_users WHERE blocker_id=? AND blocked_id=?",
+                (user["id"], target["id"]),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "DELETE FROM blocked_users WHERE blocker_id=? AND blocked_id=?",
+                    (user["id"], target["id"]),
+                )
+                blocked = False
+            else:
+                connection.execute(
+                    "INSERT INTO blocked_users(blocker_id,blocked_id) VALUES(?,?)",
+                    (user["id"], target["id"]),
+                )
+                connection.execute(
+                    """DELETE FROM follows WHERE
+                       (follower_id=? AND followed_id=?) OR (follower_id=? AND followed_id=?)""",
+                    (user["id"], target["id"], target["id"], user["id"]),
+                )
+                blocked = True
+        return {"blocked": blocked}
+
+    @app.post("/api/reports", status_code=201)
+    def report_content(data: ReportInput, user: User):
+        with db.transaction() as connection:
+            post_id = data.target_id if data.target_type == "post" else None
+            target_user_id = data.target_id if data.target_type == "user" else None
+            if post_id is not None:
+                post = visible_post(connection, post_id, user["id"])
+                if post is None:
+                    raise HTTPException(status_code=404, detail="Content not found.")
+            else:
+                target = connection.execute(
+                    "SELECT id FROM users WHERE id=?",
+                    (target_user_id,),
+                ).fetchone()
+                if target is None or target["id"] == user["id"]:
+                    raise HTTPException(status_code=404, detail="Account not found.")
+            duplicate = connection.execute(
+                """SELECT 1 FROM content_reports WHERE reporter_id=? AND target_type=?
+                   AND COALESCE(post_id,0)=COALESCE(?,0)
+                   AND COALESCE(target_user_id,0)=COALESCE(?,0) AND status='open'""",
+                (user["id"], data.target_type, post_id, target_user_id),
+            ).fetchone()
+            if duplicate:
+                raise HTTPException(status_code=409, detail="You have already reported this item.")
+            cursor = connection.execute(
+                """INSERT INTO content_reports(reporter_id,target_type,post_id,target_user_id,reason,details)
+                   VALUES(?,?,?,?,?,?)""",
+                (user["id"], data.target_type, post_id, target_user_id, data.reason, data.details),
+            )
+        return {"id": cursor.lastrowid, "message": "Thanks. Your report was sent to the moderation team."}
+
+    @app.get("/api/moderation/reports")
+    def moderation_reports(user: User, status_filter: str = Query(default="open", alias="status")):
+        require_moderator(user)
+        if status_filter not in {"open", "reviewed", "actioned", "dismissed", "all"}:
+            raise HTTPException(status_code=422, detail="Unknown report status.")
+        with db.locked_connection() as connection:
+            rows = connection.execute(
+                """SELECT r.id,r.target_type,r.post_id,r.target_user_id,r.reason,r.details,
+                          r.status,r.created_at,reporter.username AS reporter_username,
+                          COALESCE(target.username,post_author.username) AS target_username,
+                          p.body AS post_body
+                   FROM content_reports r
+                   JOIN users reporter ON reporter.id=r.reporter_id
+                   LEFT JOIN users target ON target.id=r.target_user_id
+                   LEFT JOIN posts p ON p.id=r.post_id
+                   LEFT JOIN users post_author ON post_author.id=p.user_id
+                   WHERE (?='all' OR r.status=?) ORDER BY r.id DESC LIMIT 200""",
+                (status_filter, status_filter),
+            ).fetchall()
+        return {"reports": [dict(row) for row in rows]}
+
+    @app.patch("/api/moderation/reports/{report_id}")
+    def update_moderation_report(report_id: int, data: ReportStatusInput, user: User):
+        require_moderator(user)
+        with db.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE content_reports SET status=?,reviewed_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (data.status, report_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Report not found.")
+        return {"ok": True}
+
+    @app.delete("/api/moderation/posts/{post_id}")
+    def remove_reported_post(post_id: int, user: User):
+        require_moderator(user)
+        with db.transaction() as connection:
+            rows = connection.execute(
+                """SELECT filename FROM post_media WHERE post_id=?
+                   UNION ALL
+                   SELECT rm.filename FROM reply_media rm
+                   JOIN replies r ON r.id=rm.reply_id WHERE r.post_id=?""",
+                (post_id, post_id),
+            ).fetchall()
+            connection.execute(
+                """DELETE FROM posts WHERE id IN (
+                       SELECT rr.share_post_id FROM reply_reposts rr
+                       JOIN replies r ON r.id=rr.reply_id WHERE r.post_id=?
+                   )""",
+                (post_id,),
+            )
+            cursor = connection.execute("DELETE FROM posts WHERE id=?", (post_id,))
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Post not found.")
+            connection.execute(
+                """UPDATE content_reports SET status='actioned',reviewed_at=CURRENT_TIMESTAMP
+                   WHERE post_id=? AND status='open'""",
+                (post_id,),
+            )
+        for row in rows:
+            if re.fullmatch(r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", row["filename"]):
+                (media_dir / row["filename"]).unlink(missing_ok=True)
+        return {"ok": True}
 
     @app.post("/api/users/{username}/follow")
-    def toggle_follow(username: str, user: User):
+    def toggle_follow(username: str, background_tasks: BackgroundTasks, user: User):
         with db.transaction() as connection:
             target = connection.execute("SELECT id FROM users WHERE username=?", (username.lower().lstrip("@"),)).fetchone()
             if target is None:
                 raise HTTPException(status_code=404, detail="Profile not found.")
             if target["id"] == user["id"]:
                 raise HTTPException(status_code=400, detail="You cannot follow yourself.")
+            if is_blocked(connection, user["id"], target["id"]):
+                raise HTTPException(status_code=404, detail="Profile not found.")
             existing = connection.execute(
                 "SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?", (user["id"], target["id"])
             ).fetchone()
@@ -1189,26 +1692,48 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 connection.execute(
                     "INSERT INTO follows(follower_id,followed_id) VALUES(?,?)", (user["id"], target["id"])
                 )
-                connection.execute(
-                    "INSERT INTO notifications(user_id,actor_id,kind) VALUES(?,?,'follow')",
-                    (target["id"], user["id"]),
-                )
+                add_activity(connection, target["id"], user["id"], "follow")
                 following = True
+        if following:
+            schedule_push(
+                background_tasks, target["id"], "New follower",
+                f"@{user['username']} started following you.",
+                {"screen": "activities"},
+            )
         return {"following": following}
 
     @app.post("/api/posts", status_code=201)
-    def create_post(data: PostInput, user: User):
+    def create_post(data: PostInput, background_tasks: BackgroundTasks, user: User):
+        require_terms_accepted(user["id"])
+        if not data.body and not data.quoted_post_id and not data.quoted_reply_id:
+            raise HTTPException(status_code=422, detail="Write a post or choose an item to quote.")
         with db.transaction() as connection:
+            quote_target = validate_quote_target(
+                connection, user["id"], data.quoted_post_id, data.quoted_reply_id, data.visibility,
+            )
             cursor = connection.execute(
-                "INSERT INTO posts(user_id,body,visibility) VALUES(?,?,?)",
-                (user["id"], data.body, data.visibility),
+                """INSERT INTO posts(user_id,body,visibility,quoted_post_id,quoted_reply_id)
+                   VALUES(?,?,?,?,?)""",
+                (user["id"], data.body, data.visibility, data.quoted_post_id, data.quoted_reply_id),
             )
             post_id = cursor.lastrowid
+            if quote_target:
+                add_activity(
+                    connection, quote_target["user_id"], user["id"], "quote",
+                    post_id=quote_target["post_id"], reply_id=quote_target["reply_id"],
+                )
             row = visible_post(connection, post_id, user["id"])
+        if quote_target:
+            schedule_push(
+                background_tasks, quote_target["user_id"], "New quote",
+                f"@{user['username']} quoted your post.",
+                {"screen": "activities", "post_id": quote_target["post_id"]},
+            )
         return {"post": post_payload(row)}
 
     @app.post("/api/posts/media", status_code=201)
-    async def create_post_with_media(request: Request, user: User):
+    async def create_post_with_media(request: Request, background_tasks: BackgroundTasks, user: User):
+        require_terms_accepted(user["id"])
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -1219,7 +1744,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 raise HTTPException(status_code=400, detail="Invalid content length.")
             if request_size > POST_MEDIA_MAX_BYTES * POST_MEDIA_MAX_FILES + 256 * 1024:
                 raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
-        form = await request.form(max_files=POST_MEDIA_MAX_FILES + 1, max_fields=3)
+        form = await request.form(max_files=POST_MEDIA_MAX_FILES + 1, max_fields=6)
         try:
             body = form.get("body", "")
             visibility = form.get("visibility", "public")
@@ -1231,7 +1756,12 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             if len(uploads) > POST_MEDIA_MAX_FILES:
                 raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
             try:
-                data = MediaPostInput(body=body, visibility=visibility)
+                data = MediaPostInput(
+                    body=body,
+                    visibility=visibility,
+                    quoted_post_id=form.get("quoted_post_id") or None,
+                    quoted_reply_id=form.get("quoted_reply_id") or None,
+                )
             except ValueError as error:
                 raise HTTPException(status_code=422, detail="Post details are invalid.") from error
             if not uploads:
@@ -1255,9 +1785,16 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                     })
                     (media_dir / filename).write_bytes(content)
                 with db.transaction() as connection:
+                    quote_target = validate_quote_target(
+                        connection, user["id"], data.quoted_post_id, data.quoted_reply_id,
+                        data.visibility,
+                    )
+                    if not data.body and not quote_target and not stored_media:
+                        raise HTTPException(status_code=422, detail="Write a post or choose an item to quote.")
                     cursor = connection.execute(
-                        "INSERT INTO posts(user_id,body,visibility) VALUES(?,?,?)",
-                        (user["id"], data.body, data.visibility),
+                        """INSERT INTO posts(user_id,body,visibility,quoted_post_id,quoted_reply_id)
+                           VALUES(?,?,?,?,?)""",
+                        (user["id"], data.body, data.visibility, data.quoted_post_id, data.quoted_reply_id),
                     )
                     post_id = cursor.lastrowid
                     for item in stored_media:
@@ -1266,12 +1803,23 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                                VALUES(?,?,?,?)""",
                             (post_id, item["filename"], item["media_type"], item["position"]),
                         )
+                    if quote_target:
+                        add_activity(
+                            connection, quote_target["user_id"], user["id"], "quote",
+                            post_id=quote_target["post_id"], reply_id=quote_target["reply_id"],
+                        )
                     row = visible_post(connection, post_id, user["id"])
                 completed = True
             finally:
                 if not completed:
                     for item in stored_media:
                         (media_dir / item["filename"]).unlink(missing_ok=True)
+            if quote_target:
+                schedule_push(
+                    background_tasks, quote_target["user_id"], "New quote",
+                    f"@{user['username']} quoted your post.",
+                    {"screen": "activities", "post_id": quote_target["post_id"]},
+                )
             return {"post": post_payload(row)}
         finally:
             await form.close()
@@ -1281,20 +1829,56 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         if scope not in {"all", "following", "bookmarks"}:
             raise HTTPException(status_code=422, detail="Unknown feed scope.")
         with db.locked_connection() as connection:
-            where = """(p.user_id=? OR p.visibility='public' OR
-                        (p.visibility='followers' AND EXISTS(
-                            SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id)))"""
-            params = [user["id"], user["id"]]
+            where = """(
+                            p.user_id=? OR p.visibility='public' OR
+                            (p.visibility='followers' AND EXISTS(
+                                SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id
+                            )) OR EXISTS(
+                                SELECT 1 FROM post_reposts rr WHERE rr.post_id=p.id AND
+                                    (rr.user_id=? OR EXISTS(
+                                        SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=rr.user_id
+                                    )) AND NOT EXISTS(
+                                        SELECT 1 FROM blocked_users b
+                                        WHERE (b.blocker_id=? AND b.blocked_id=rr.user_id)
+                                           OR (b.blocker_id=rr.user_id AND b.blocked_id=?)
+                                    )
+                            )
+                        ) AND NOT EXISTS(
+                            SELECT 1 FROM blocked_users b
+                            WHERE (b.blocker_id=? AND b.blocked_id=p.user_id)
+                               OR (b.blocker_id=p.user_id AND b.blocked_id=?)
+                        )"""
+            params = [
+                user["id"], user["id"], user["id"], user["id"],
+                user["id"], user["id"], user["id"], user["id"],
+            ]
             if scope == "following":
                 where += """ AND (p.user_id=? OR EXISTS(
-                             SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id))"""
-                params.extend((user["id"], user["id"]))
+                             SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id)
+                             OR EXISTS(SELECT 1 FROM post_reposts rr WHERE rr.post_id=p.id AND
+                                 (rr.user_id=? OR EXISTS(
+                                     SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=rr.user_id))
+                                 AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                                     WHERE (b.blocker_id=? AND b.blocked_id=rr.user_id)
+                                        OR (b.blocker_id=rr.user_id AND b.blocked_id=?))))"""
+                params.extend((user["id"], user["id"], user["id"], user["id"], user["id"], user["id"]))
             elif scope == "bookmarks":
                 where += " AND EXISTS(SELECT 1 FROM bookmarks b WHERE b.user_id=? AND b.post_id=p.id)"
                 params.append(user["id"])
-            params.extend((limit, offset))
+            params.extend((user["id"], user["id"], user["id"], user["id"], limit, offset))
             ids = connection.execute(
-                f"SELECT p.id FROM posts p WHERE {where} ORDER BY p.id DESC LIMIT ? OFFSET ?",
+                f"""SELECT p.id FROM posts p WHERE {where}
+                    ORDER BY COALESCE((
+                        SELECT MAX(rr.created_at) FROM post_reposts rr
+                        WHERE rr.post_id=p.id AND
+                            (rr.user_id=? OR EXISTS(
+                                SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=rr.user_id
+                            )) AND NOT EXISTS(
+                                SELECT 1 FROM blocked_users b
+                                WHERE (b.blocker_id=? AND b.blocked_id=rr.user_id)
+                                   OR (b.blocker_id=rr.user_id AND b.blocked_id=?)
+                            )
+                    ),p.created_at) DESC,p.id DESC LIMIT ? OFFSET ?""",
                 params,
             ).fetchall()
             results = []
@@ -1312,27 +1896,42 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             if row is None:
                 raise HTTPException(status_code=404, detail="Post not found.")
             replies = connection.execute(
-                """SELECT r.id,r.body,r.created_at,u.id AS user_id,u.username,p.display_name,p.avatar_filename
-                   FROM replies r JOIN users u ON u.id=r.user_id JOIN profiles p ON p.user_id=u.id
-                   WHERE r.post_id=? ORDER BY r.id LIMIT 100""",
-                (post_id,),
+                """SELECT r.id FROM replies r JOIN users u ON u.id=r.user_id
+                   WHERE r.post_id=? AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                       WHERE (b.blocker_id=? AND b.blocked_id=u.id)
+                          OR (b.blocker_id=u.id AND b.blocked_id=?))
+                   ORDER BY r.id LIMIT 100""",
+                (post_id, user["id"], user["id"]),
             ).fetchall()
-        return {"post": post_payload(row), "replies": [
-            {"id": r["id"], "body": r["body"], "created_at": r["created_at"],
-             "author": {
-                 "id": r["user_id"], "username": r["username"], "display_name": r["display_name"],
-                 "avatar_url": f"/api/avatars/{r['user_id']}" if r["avatar_filename"] else None,
-             }}
-            for r in replies
-        ]}
+            reply_payloads = [
+                reply for item in replies
+                if (reply := visible_reply(connection, item["id"], user["id"])) is not None
+            ]
+        return {"post": post_payload(row), "replies": reply_payloads}
 
     @app.delete("/api/posts/{post_id}")
     def delete_post(post_id: int, user: User):
-        with db.transaction() as connection:
+        with db.locked_connection() as connection:
             media_rows = connection.execute(
-                "SELECT filename FROM post_media WHERE post_id=?",
-                (post_id,),
+                """SELECT filename FROM post_media WHERE post_id=?
+                   UNION ALL
+                   SELECT rm.filename FROM reply_media rm JOIN replies r ON r.id=rm.reply_id
+                   WHERE r.post_id=?""",
+                (post_id, post_id),
             ).fetchall()
+        with db.transaction() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM posts WHERE id=? AND user_id=?",
+                (post_id, user["id"]),
+            ).fetchone():
+                raise HTTPException(status_code=404, detail="Post not found or unavailable.")
+            connection.execute(
+                """DELETE FROM posts WHERE id IN (
+                       SELECT rr.share_post_id FROM reply_reposts rr
+                       JOIN replies r ON r.id=rr.reply_id WHERE r.post_id=?
+                   )""",
+                (post_id,),
+            )
             cursor = connection.execute("DELETE FROM posts WHERE id=? AND user_id=?", (post_id, user["id"]))
             if cursor.rowcount == 0:
                 exists = connection.execute("SELECT 1 FROM posts WHERE id=?", (post_id,)).fetchone()
@@ -1343,7 +1942,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         return {"ok": True}
 
     @app.post("/api/posts/{post_id}/replies", status_code=201)
-    def create_reply(post_id: int, data: MessageInput, user: User):
+    def create_reply(post_id: int, data: MessageInput, background_tasks: BackgroundTasks, user: User):
+        require_terms_accepted(user["id"])
         with db.transaction() as connection:
             post = visible_post(connection, post_id, user["id"])
             if post is None:
@@ -1351,26 +1951,223 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             cursor = connection.execute(
                 "INSERT INTO replies(post_id,user_id,body) VALUES(?,?,?)", (post_id, user["id"], data.body)
             )
-            if post["user_id"] != user["id"]:
-                connection.execute(
-                    "INSERT INTO notifications(user_id,actor_id,kind,post_id) VALUES(?,?,'reply',?)",
-                    (post["user_id"], user["id"], post_id),
-                )
             reply_id = cursor.lastrowid
-        return {"id": reply_id, "body": data.body, "post_id": post_id}
+            add_activity(connection, post["user_id"], user["id"], "reply", post_id=post_id, reply_id=reply_id)
+            reply = visible_reply(connection, reply_id, user["id"])
+        if post["user_id"] != user["id"]:
+            schedule_push(
+                background_tasks, post["user_id"], "New reply",
+                f"@{user['username']} replied to your post.",
+                {"screen": "activities", "post_id": post_id, "reply_id": reply_id},
+            )
+        return reply
+
+    @app.post("/api/posts/{post_id}/replies/media", status_code=201)
+    async def create_reply_with_media(
+        post_id: int,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        user: User,
+    ):
+        require_terms_accepted(user["id"])
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                request_size = int(content_length)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid content length.")
+            if request_size < 0:
+                raise HTTPException(status_code=400, detail="Invalid content length.")
+            if request_size > POST_MEDIA_MAX_BYTES * POST_MEDIA_MAX_FILES + 256 * 1024:
+                raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
+        form = await request.form(max_files=POST_MEDIA_MAX_FILES + 1, max_fields=1)
+        try:
+            body = form.get("body", "")
+            uploads = form.getlist("media")
+            if not isinstance(body, str) or any(
+                not isinstance(upload, StarletteUploadFile) for upload in uploads
+            ):
+                raise HTTPException(status_code=422, detail="Reply details are invalid.")
+            if len(uploads) > POST_MEDIA_MAX_FILES:
+                raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
+            try:
+                data = MediaReplyInput(body=body)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail="Reply details are invalid.") from error
+            if not data.body and not uploads:
+                raise HTTPException(status_code=422, detail="Write a reply or attach media.")
+            stored_media = []
+            media_dir.mkdir(parents=True, exist_ok=True)
+            completed = False
+            try:
+                for position, upload in enumerate(uploads):
+                    content = await upload.read(POST_MEDIA_MAX_BYTES + 1)
+                    if len(content) > POST_MEDIA_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="The selected media could not be uploaded.")
+                    if not content:
+                        raise HTTPException(status_code=400, detail="The selected media could not be uploaded.")
+                    media_type, extension = post_media_type(content, upload.content_type)
+                    filename = f"{uuid.uuid4().hex}.{extension}"
+                    stored_media.append({
+                        "filename": filename,
+                        "media_type": media_type,
+                        "position": position,
+                    })
+                    (media_dir / filename).write_bytes(content)
+                with db.transaction() as connection:
+                    post = visible_post(connection, post_id, user["id"])
+                    if post is None:
+                        raise HTTPException(status_code=404, detail="Post not found.")
+                    cursor = connection.execute(
+                        "INSERT INTO replies(post_id,user_id,body) VALUES(?,?,?)",
+                        (post_id, user["id"], data.body),
+                    )
+                    reply_id = cursor.lastrowid
+                    for item in stored_media:
+                        connection.execute(
+                            """INSERT INTO reply_media(reply_id,filename,media_type,position)
+                               VALUES(?,?,?,?)""",
+                            (reply_id, item["filename"], item["media_type"], item["position"]),
+                        )
+                    add_activity(
+                        connection, post["user_id"], user["id"], "reply",
+                        post_id=post_id, reply_id=reply_id,
+                    )
+                    reply = visible_reply(connection, reply_id, user["id"])
+                completed = True
+            finally:
+                if not completed:
+                    for item in stored_media:
+                        (media_dir / item["filename"]).unlink(missing_ok=True)
+            if post["user_id"] != user["id"]:
+                schedule_push(
+                    background_tasks, post["user_id"], "New reply",
+                    f"@{user['username']} replied to your post.",
+                    {"screen": "activities", "post_id": post_id, "reply_id": reply_id},
+                )
+            return reply
+        finally:
+            await form.close()
 
     @app.delete("/api/replies/{reply_id}")
     def delete_reply(reply_id: int, user: User):
+        with db.locked_connection() as connection:
+            media_rows = connection.execute(
+                "SELECT filename FROM reply_media WHERE reply_id=?",
+                (reply_id,),
+            ).fetchall()
+            repost_rows = connection.execute(
+                "SELECT share_post_id FROM reply_reposts WHERE reply_id=?",
+                (reply_id,),
+            ).fetchall()
         with db.transaction() as connection:
             cursor = connection.execute(
                 "DELETE FROM replies WHERE id=? AND user_id=?", (reply_id, user["id"])
             )
             if cursor.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Reply not found or unavailable.")
+            for repost in repost_rows:
+                connection.execute(
+                    "DELETE FROM posts WHERE id=? AND user_id=?",
+                    (repost["share_post_id"], user["id"]),
+                )
+        for media_row in media_rows:
+            if re.fullmatch(r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", media_row["filename"]):
+                (media_dir / media_row["filename"]).unlink(missing_ok=True)
         return {"ok": True}
 
+    @app.post("/api/replies/{reply_id}/reaction")
+    def toggle_reply_reaction(reply_id: int, background_tasks: BackgroundTasks, user: User):
+        with db.transaction() as connection:
+            reply = visible_reply(connection, reply_id, user["id"])
+            if reply is None:
+                raise HTTPException(status_code=404, detail="Reply not found.")
+            existing = connection.execute(
+                "SELECT 1 FROM reply_reactions WHERE user_id=? AND reply_id=?",
+                (user["id"], reply_id),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "DELETE FROM reply_reactions WHERE user_id=? AND reply_id=?",
+                    (user["id"], reply_id),
+                )
+                reacted = False
+            else:
+                connection.execute(
+                    "INSERT INTO reply_reactions(user_id,reply_id) VALUES(?,?)",
+                    (user["id"], reply_id),
+                )
+                target = connection.execute(
+                    """SELECT r.user_id,r.post_id FROM replies r WHERE r.id=?""",
+                    (reply_id,),
+                ).fetchone()
+                add_activity(
+                    connection, target["user_id"], user["id"], "reply_reaction",
+                    post_id=target["post_id"], reply_id=reply_id,
+                )
+                reacted = True
+        if reacted and reply["author"]["id"] != user["id"]:
+            schedule_push(
+                background_tasks, reply["author"]["id"], "New like",
+                f"@{user['username']} liked your reply.",
+                {"screen": "activities", "post_id": reply["post_id"], "reply_id": reply_id},
+            )
+        return {"reacted": reacted}
+
+    @app.post("/api/replies/{reply_id}/repost")
+    def toggle_reply_repost(reply_id: int, background_tasks: BackgroundTasks, user: User):
+        with db.transaction() as connection:
+            reply = visible_reply(connection, reply_id, user["id"])
+            if reply is None:
+                raise HTTPException(status_code=404, detail="Reply not found.")
+            existing = connection.execute(
+                "SELECT share_post_id FROM reply_reposts WHERE user_id=? AND reply_id=?",
+                (user["id"], reply_id),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "DELETE FROM reply_reposts WHERE user_id=? AND reply_id=?",
+                    (user["id"], reply_id),
+                )
+                connection.execute(
+                    "DELETE FROM posts WHERE id=? AND user_id=? AND quoted_reply_id=?",
+                    (existing["share_post_id"], user["id"], reply_id),
+                )
+                reposted = False
+            else:
+                parent = connection.execute(
+                    "SELECT visibility,user_id FROM posts WHERE id=?",
+                    (reply["post_id"],),
+                ).fetchone()
+                cursor = connection.execute(
+                    """INSERT INTO posts(user_id,body,visibility,quoted_reply_id)
+                       VALUES(?,?,?,?)""",
+                    (
+                        user["id"],
+                        "",
+                        "public" if parent["visibility"] == "public" else "private",
+                        reply_id,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO reply_reposts(user_id,reply_id,share_post_id) VALUES(?,?,?)",
+                    (user["id"], reply_id, cursor.lastrowid),
+                )
+                add_activity(
+                    connection, reply["author"]["id"], user["id"], "reply_repost",
+                    post_id=reply["post_id"], reply_id=reply_id,
+                )
+                reposted = True
+        if reposted and reply["author"]["id"] != user["id"]:
+            schedule_push(
+                background_tasks, reply["author"]["id"], "New repost",
+                f"@{user['username']} reposted your reply.",
+                {"screen": "activities", "post_id": reply["post_id"], "reply_id": reply_id},
+            )
+        return {"reposted": reposted}
+
     @app.post("/api/posts/{post_id}/reaction")
-    def toggle_reaction(post_id: int, user: User):
+    def toggle_reaction(post_id: int, background_tasks: BackgroundTasks, user: User):
         with db.transaction() as connection:
             post = visible_post(connection, post_id, user["id"])
             if post is None:
@@ -1384,12 +2181,47 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             else:
                 connection.execute("INSERT INTO reactions(user_id,post_id) VALUES(?,?)", (user["id"], post_id))
                 if post["user_id"] != user["id"]:
-                    connection.execute(
-                        "INSERT INTO notifications(user_id,actor_id,kind,post_id) VALUES(?,?,'reaction',?)",
-                        (post["user_id"], user["id"], post_id),
-                    )
+                    add_activity(connection, post["user_id"], user["id"], "reaction", post_id=post_id)
                 reacted = True
+        if reacted and post["user_id"] != user["id"]:
+            schedule_push(
+                background_tasks, post["user_id"], "New like",
+                f"@{user['username']} liked your post.",
+                {"screen": "activities", "post_id": post_id},
+            )
         return {"reacted": reacted}
+
+    @app.post("/api/posts/{post_id}/repost")
+    def toggle_repost(post_id: int, background_tasks: BackgroundTasks, user: User):
+        with db.transaction() as connection:
+            post = visible_post(connection, post_id, user["id"], include_quote=False)
+            if post is None:
+                raise HTTPException(status_code=404, detail="Post not found.")
+            existing = connection.execute(
+                "SELECT 1 FROM post_reposts WHERE user_id=? AND post_id=?",
+                (user["id"], post_id),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "DELETE FROM post_reposts WHERE user_id=? AND post_id=?",
+                    (user["id"], post_id),
+                )
+                reposted = False
+            else:
+                connection.execute(
+                    "INSERT INTO post_reposts(user_id,post_id) VALUES(?,?)",
+                    (user["id"], post_id),
+                )
+                if post["user_id"] != user["id"]:
+                    add_activity(connection, post["user_id"], user["id"], "repost", post_id=post_id)
+                reposted = True
+        if reposted and post["user_id"] != user["id"]:
+            schedule_push(
+                background_tasks, post["user_id"], "New repost",
+                f"@{user['username']} reposted your post.",
+                {"screen": "activities", "post_id": post_id},
+            )
+        return {"reposted": reposted}
 
     @app.post("/api/posts/{post_id}/bookmark")
     def toggle_bookmark(post_id: int, user: User):
@@ -1409,13 +2241,23 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     @app.get("/api/search")
     def search(user: User, q: str = Query(min_length=1, max_length=120)):
-        term = f"%{q.strip()}%"
+        query = q.strip()
+        username_query = query.startswith("@")
+        search_value = query.lstrip("@") if username_query else query
+        if not search_value:
+            raise HTTPException(status_code=422, detail="Enter a username after @.")
+        term = f"%{search_value}%"
+        name_term = "" if username_query else term
         with db.locked_connection() as connection:
             people = connection.execute(
                 """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename FROM users u
-                   JOIN profiles p ON p.user_id=u.id WHERE u.username LIKE ? OR p.display_name LIKE ?
+                   JOIN profiles p ON p.user_id=u.id
+                   WHERE (u.username LIKE ? OR p.display_name LIKE ?)
+                     AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                         WHERE (b.blocker_id=? AND b.blocked_id=u.id)
+                            OR (b.blocker_id=u.id AND b.blocked_id=?))
                    ORDER BY u.username LIMIT 30""",
-                (term, term),
+                (term, name_term, user["id"], user["id"]),
             ).fetchall()
             post_ids = connection.execute(
                 """SELECT p.id FROM posts p WHERE p.body LIKE ? AND
@@ -1451,6 +2293,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                        WHERE cp.conversation_id=? AND cp.user_id<>?""",
                     (row["id"], user["id"]),
                 ).fetchall()
+                if participants and is_blocked(connection, user["id"], participants[0]["id"]):
+                    continue
                 result.append({"id": row["id"], "last_message": row["last_message"],
                                "last_message_at": row["last_message_at"], "participants": [
                                    {
@@ -1464,12 +2308,15 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     @app.post("/api/conversations", status_code=201)
     def create_conversation(data: ConversationInput, user: User):
+        require_terms_accepted(user["id"])
         with db.transaction() as connection:
             recipient = connection.execute("SELECT id FROM users WHERE username=?", (data.username,)).fetchone()
             if recipient is None:
                 raise HTTPException(status_code=404, detail="Account not found.")
             if recipient["id"] == user["id"]:
                 raise HTTPException(status_code=400, detail="Choose another account.")
+            if is_blocked(connection, user["id"], recipient["id"]):
+                raise HTTPException(status_code=404, detail="Account not found.")
             existing = connection.execute(
                 """SELECT c.id FROM conversations c
                    WHERE (SELECT COUNT(*) FROM conversation_participants cp WHERE cp.conversation_id=c.id)=2
@@ -1493,6 +2340,14 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             (conversation_id, user_id),
         ).fetchone():
             raise HTTPException(status_code=404, detail="Conversation not found.")
+        other = connection.execute(
+            """SELECT user_id FROM conversation_participants
+               WHERE conversation_id=? AND user_id<>? LIMIT 1""",
+            (conversation_id, user_id),
+        ).fetchone()
+        if other and is_blocked(connection, user_id, other["user_id"]):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return other["user_id"] if other else None
 
     @app.get("/api/conversations/{conversation_id}/messages")
     def list_messages(conversation_id: int, user: User, limit: int = Query(default=100, ge=1, le=100)):
@@ -1515,12 +2370,28 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         ]}
 
     @app.post("/api/conversations/{conversation_id}/messages", status_code=201)
-    def send_message(conversation_id: int, data: MessageInput, user: User):
+    def send_message(
+        conversation_id: int,
+        data: MessageInput,
+        background_tasks: BackgroundTasks,
+        user: User,
+    ):
+        require_terms_accepted(user["id"])
         with db.transaction() as connection:
-            require_conversation_participant(connection, conversation_id, user["id"])
+            recipient_id = require_conversation_participant(connection, conversation_id, user["id"])
             cursor = connection.execute(
                 "INSERT INTO messages(conversation_id,sender_id,body) VALUES(?,?,?)",
                 (conversation_id, user["id"], data.body),
+            )
+            add_activity(
+                connection, recipient_id, user["id"], "message",
+                conversation_id=conversation_id,
+            )
+        if recipient_id is not None:
+            schedule_push(
+                background_tasks, recipient_id, f"Message from @{user['username']}",
+                "You have a new Zorlii message.",
+                {"screen": "inbox", "conversation_id": conversation_id},
             )
         return {"id": cursor.lastrowid, "body": data.body, "sender_id": user["id"]}
 
@@ -1552,18 +2423,28 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
     def notifications(user: User):
         with db.locked_connection() as connection:
             unread_count = connection.execute(
-                "SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL",
+                """SELECT COUNT(*) FROM notifications n WHERE n.user_id=? AND n.read_at IS NULL
+                   AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                       WHERE (b.blocker_id=n.user_id AND b.blocked_id=n.actor_id)
+                          OR (b.blocker_id=n.actor_id AND b.blocked_id=n.user_id))""",
                 (user["id"],),
             ).fetchone()[0]
             rows = connection.execute(
-                """SELECT n.id,n.actor_id,n.kind,n.post_id,n.created_at,n.read_at,
+                """SELECT n.id,n.actor_id,
+                          COALESCE(NULLIF(n.activity_kind,''),n.kind) AS kind,
+                          n.post_id,n.reply_id,n.conversation_id,n.created_at,n.read_at,
                           u.username,p.display_name,p.avatar_filename
                    FROM notifications n JOIN users u ON u.id=n.actor_id JOIN profiles p ON p.user_id=u.id
-                   WHERE n.user_id=? ORDER BY n.id DESC LIMIT 100""",
+                   WHERE n.user_id=? AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                       WHERE (b.blocker_id=n.user_id AND b.blocked_id=n.actor_id)
+                          OR (b.blocker_id=n.actor_id AND b.blocked_id=n.user_id))
+                   ORDER BY n.id DESC LIMIT 100""",
                 (user["id"],),
             ).fetchall()
         return {"notifications": [
-            {"id": r["id"], "kind": r["kind"], "post_id": r["post_id"], "created_at": r["created_at"],
+            {"id": r["id"], "kind": r["kind"], "post_id": r["post_id"],
+             "reply_id": r["reply_id"], "conversation_id": r["conversation_id"],
+             "created_at": r["created_at"],
              "read": bool(r["read_at"]), "actor": {
                  "username": r["username"], "display_name": r["display_name"],
                  "avatar_url": f"/api/avatars/{r['actor_id']}?v={r['avatar_filename'][:8]}"
@@ -1613,8 +2494,11 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                     FROM users u JOIN profiles p ON p.user_id=u.id
                     JOIN posts ON posts.user_id=u.id AND posts.visibility='public'
                     WHERE u.id<>? AND u.id NOT IN ({placeholders})
+                      AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                          WHERE (b.blocker_id=? AND b.blocked_id=u.id)
+                             OR (b.blocker_id=u.id AND b.blocked_id=?))
                     GROUP BY u.id ORDER BY u.id DESC LIMIT 50""",
-                params,
+                [*params, user["id"], user["id"]],
             ).fetchall()
         profile_text = " ".join(profile_data["interests"] + [profile_data["bio"]])
         return {

@@ -1,6 +1,6 @@
 # Zorlii
 
-Zorlii is a persistent, small-community social MVP: FastAPI + SQLite API, a branded web client, and an Expo Android/iOS client. The clients use the same API. The app does not seed demo accounts, posts, messages, profiles, or activity. New members see honest empty states. Both clients support follower/following lists and readable notifications with unread counts and read controls.
+Zorlii is a persistent, small-community social MVP: FastAPI + SQLite API, a branded web client, and an Expo Android/iOS client. The clients use the same API. The app does not seed demo accounts, posts, messages, profiles, or activity. New members see honest empty states. Both clients show follower/following counts before opening their member lists and provide an Activities screen with unread counts and read controls.
 
 ## Run the API and web app (Windows)
 
@@ -40,7 +40,7 @@ Set that value as `ZORLII_OTP_SECRET`. For Railway Free, Trial, or Hobby plans, 
 
 ## Expo mobile client
 
-The Expo source is in `zorlii_app\mobile`. It stores bearer sessions with Expo SecureStore and supports email-verified sign-up, OTP password recovery, sign-in, Pulse, posting, reactions, bookmarks, replies, search, follow, follower/following lists, notifications, private conversations, profile-photo selection/change/removal, profile/consent settings, and local extractive assistance.
+The Expo source is in `zorlii_app\mobile`. It stores bearer sessions with Expo SecureStore and supports email-verified sign-up, OTP password recovery, sign-in, Pulse, posts and replies with photos/videos, likes, reposts, quotes, bookmarks, search, follow, follower/following lists, Activities, private conversations, profile-photo selection/change/removal, profile/consent settings, content and account reports, blocking/unblocking, moderator report review, and local extractive assistance. Foreground views refresh automatically; phone push delivery uses Expo Push Service.
 
 Use Node.js 22.13 or newer for the current Expo SDK. An Android APK can be built locally with the Android SDK installed, or through EAS Build. The project includes `eas.json` profiles for an internal-test APK and a production Android App Bundle.
 
@@ -51,6 +51,7 @@ Use Node.js 22.13 or newer for the current Expo SDK. An Android APK can be built
 ```powershell
 cd C:\Users\sylde\OneDrive\Desktop\ZORLII_app\zorlii_app\mobile
 $env:EXPO_PUBLIC_API_URL = "http://192.168.1.156:8000" # replace with this PC's current Wi-Fi IPv4
+$env:APP_ENV = "development"
 npm install
 npm run typecheck
 npx expo start
@@ -65,27 +66,48 @@ The local test APK uses HTTP to reach the development server over your private W
 ```powershell
 cd C:\Users\sylde\OneDrive\Desktop\ZORLII_app\zorlii_app\mobile
 $env:EXPO_PUBLIC_API_URL = "http://192.168.1.156:8000" # replace with this PC's current Wi-Fi IPv4
+$env:APP_ENV = "development"
 npx expo prebuild --platform android
 .\android\gradlew.bat assembleDebug
 ```
 
 The APK is created at `mobile\android\app\build\outputs\apk\debug\app-debug.apk`. Copy it to the Android phone and open it to install (allow installs from that source if Android prompts). Keep the FastAPI server running and the phone on the same Wi-Fi. The IP address is compiled into the APK, so rebuild if it changes. This is a debug/test APK, not a Play Store release.
 
-For an EAS cloud preview APK instead, sign in with an Expo account, set `EXPO_PUBLIC_API_URL` to a reachable HTTPS API URL, then run `npx eas-cli@latest build --platform android --profile preview`. EAS requires Expo authentication. Production store builds also require signing and release configuration.
+For an EAS cloud preview APK instead, sign in with an Expo account and run `npx eas-cli@latest build --platform android --profile preview`; the profile uses `https://zorlii.app`. Production builds use the same HTTPS API, disable cleartext traffic, and produce an Android App Bundle:
+
+```powershell
+npx eas-cli@latest build --platform android --profile production
+```
+
+EAS requires Expo authentication and Android signing credentials; it can generate and securely manage the Android keystore. Link this project to an Expo project with `npx eas-cli@latest init` before the first cloud build.
 
 ## API overview
 
 - `POST /api/auth/register`, `/register/resend`, `/register/verify`, `/login`, `/logout`, `/forgot-password`, `/reset-password`; `/api/me`
 - `GET/PATCH /api/profile`; `PUT/DELETE /api/profile/avatar`; `GET /api/avatars/{user_id}`; `GET /api/users/{username}`, `/posts`, `/followers`, and `/following`; `POST /api/users/{username}/follow`
-- `GET /api/feed?scope=all|following|bookmarks`; `POST /api/posts`; post read/delete and reply/reaction/bookmark actions
+- `GET /api/blocks`; `POST /api/users/{username}/block` toggles a block; `POST /api/reports` submits a post or account report. Moderator-only report review and reported-post removal use `/api/moderation/*`.
+- `GET /api/feed?scope=all|following|bookmarks`; `POST /api/posts` supports quotes; `/api/posts/media` supports quoted posts with uploaded media; post reposts, reply reactions/reposts, and reply media use the `/api/posts/*` and `/api/replies/*` routes.
 - `GET/POST /api/conversations`; participant-only message read/send/edit/delete
-- `GET /api/search?q=...`; `GET /api/notifications`, `PATCH /api/notifications/{id}/read`, and `POST /api/notifications/read`; `GET /api/recommendations`
+- `GET /api/search?q=...` searches display names and usernames (prefix a username with `@`); `GET /api/notifications` supplies Activities; `PATCH /api/notifications/{id}/read` and `POST /api/notifications/read` update read state; `GET /api/recommendations`
+- `POST/DELETE /api/push-token` registers or removes the signed-in device's Expo push token.
 - `GET /api/account/export` downloads the authenticated member's account data; `DELETE /api/account` permanently deletes the account after password confirmation.
 - `POST /api/context` is local extractive selection only, gated by saved opt-in and per-request consent.
 
-Web authentication uses HttpOnly SameSite cookies. Mobile authentication uses bearer tokens; session tokens are stored hashed server-side and expiry/logout/password reset revoke sessions. Private and followers-only posts are filtered on the server, and private messages require conversation membership. Likes, follows, replies, and reactions produce persisted notifications; both clients can list these events, see unread counts, and mark items or all items as read. Follower/following endpoints return real member profiles with pagination. The opt-in recommendation endpoint compares a member's profile to **actual public posts only**, with no bundled corpus. Context assistance handles only text supplied for that request and does not persist it or call an external service.
+Web authentication uses HttpOnly SameSite cookies. Mobile authentication uses bearer tokens; session tokens are stored hashed server-side and expiry/logout/password reset revoke sessions. Private and followers-only posts are filtered on the server, and private messages require conversation membership. Likes, follows, replies, quotes, reposts, and messages produce persisted activity records; clients can list events, see unread counts, and mark items or all items as read. The opt-in recommendation endpoint compares a member's profile to **actual public posts only**, with no bundled corpus. Context assistance handles only text supplied for that request and does not persist it or call an external service.
 
 Members can export their profile and account-owned social data as JSON. Exports never contain password hashes or session tokens. Account deletion requires the current password (and an additional username confirmation in the clients); it removes the account, profile, posts, replies, follows, reactions, bookmarks, notifications, and messages sent by that member. Messages written by other participants remain available to them.
+
+## Play Store policy and moderation setup
+
+The public policy pages are served at `https://zorlii.app/privacy`, `https://zorlii.app/terms`, and `https://zorlii.app/account-deletion`. New members confirm that they are at least 18 and accept the Terms of Use and Privacy Policy during signup. Existing members are prompted to accept before contributing content. Users can report posts or accounts, block and unblock accounts, and moderators can review reports and remove reported posts in the app.
+
+Push registration needs a linked EAS project ID in the Expo config and valid Android FCM and iOS APNs credentials in EAS. The backend sends generic activity alerts via Expo Push Service after its API response; it does not include direct-message text in push previews. Until push credentials and a production build are configured, automatic foreground refresh still works, but background/closed-app pushes are not guaranteed.
+
+To configure phone push, run `npx eas-cli@latest init` from `mobile` and configure the Android FCM and iOS APNs credentials with `npx eas-cli@latest credentials`. If the EAS project ID is not written into the Expo config, set `EXPO_PUBLIC_EAS_PROJECT_ID` to that project UUID before running EAS builds. Push permissions are requested on sign-in and can be retried from the profile. Test push on a physical device using an EAS development or production build; Expo Go is not a production push test environment.
+
+Set `ZORLII_MODERATOR_EMAILS` in Railway to a comma-separated list of email addresses that sign in to Zorlii and should receive moderator tools. Keep this list restricted to trusted moderators. Configure the support contact shown on the public policy pages by updating `benefit19990@gmail.com` in `legal/privacy.html`, `legal/terms.html`, and `legal/account-deletion.html` if the support address changes.
+
+The Android application ID is `com.zorlii.app`; it is configured for a production Android App Bundle and Expo SDK 58's default target SDK is API 36. Confirm that the Play Console app listing uses this exact ID before its first upload. The production EAS profile requires an Expo account and project link. A Play Console personal developer account created after November 13, 2023 must complete the Play Console closed-test requirement (at least 12 testers opted in continuously for 14 days) before requesting production access. Store listing assets, the Data safety form, content rating, app-access instructions, and the closed test still need to be completed in Play Console; this repository does not submit or publish the app.
 
 ## Tests and checks
 
@@ -102,6 +124,6 @@ API tests inject in-memory mail senders; they do not contact SMTP or expose code
 
 ## MVP boundaries
 
-This is a local-development MVP, not a production deployment recipe: HTTPS termination, CSRF strategy for cookie clients, stronger production abuse controls, database migration tooling, backups, moderation/reporting, and production observability still need deployment planning. Email OTP verification works when SMTP and the private OTP key are configured; live provider delivery has not been verified. The UI only displays real persisted records and does not claim release-store availability.
+This is a local-development MVP, not a complete production deployment recipe: HTTPS termination, CSRF strategy for cookie clients, stronger production abuse controls, database migration tooling, backups, and production observability still need deployment planning. User reporting, blocking, terms acceptance, public policy pages, and moderator report actions are implemented, but moderators must be configured and reports must be actively reviewed. Email OTP verification works when the email provider and private OTP key are configured; live provider delivery has not been re-verified here. The app has not been submitted to or published in an app store.
 
 The current Expo 58 dependency audit reports five **moderate** transitive advisories in Expo CLI's `glob`/`minimatch` tooling (no high or critical findings); the audit's offered fix is a major Expo SDK downgrade. Review this dependency tree again before a release and update Expo when a compatible patch is available.

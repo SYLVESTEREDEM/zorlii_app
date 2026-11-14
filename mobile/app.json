@@ -4,6 +4,7 @@
     "slug": "zorlii",
     "scheme": "zorlii",
     "version": "1.0.0",
+    "icon": "./assets/zorlii-logo.png",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "plugins": [
@@ -11,9 +12,10 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow Zorlii to choose a profile photo."
+          "photosPermission": "Allow Zorlii to choose a profile photo and attach photos or videos to posts."
         }
       ],
+      "expo-notifications",
       "expo-video"
     ],
     "ios": {
@@ -22,7 +24,10 @@
     },
     "android": {
       "package": "com.zorlii.app",
-      "usesCleartextTraffic": true
+      "usesCleartextTraffic": false,
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
     }
   }
 }

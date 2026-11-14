@@ -6,11 +6,19 @@
   "build": {
     "preview": {
       "distribution": "internal",
+      "env": {
+        "APP_ENV": "preview",
+        "EXPO_PUBLIC_API_URL": "https://zorlii.app"
+      },
       "android": {
         "buildType": "apk"
       }
     },
     "production": {
+      "env": {
+        "APP_ENV": "production",
+        "EXPO_PUBLIC_API_URL": "https://zorlii.app"
+      },
       "android": {
         "buildType": "app-bundle"
       },

@@ -1,9 +1,11 @@
 import base64
 import io
+import json
 import os
 import shutil
 import smtplib
 import sqlite3
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -71,6 +73,7 @@ class AccountApiTests(unittest.TestCase):
                 "username": username,
                 "password": "Correct horse battery staple 4!",
                 "display_name": display_name,
+                "accept_terms": True,
             },
         )
         self.assertEqual(response.status_code, 202, response.text)
@@ -86,7 +89,7 @@ class AccountApiTests(unittest.TestCase):
     def test_registration_login_and_hashed_bearer_session(self):
         response = self.client.post("/api/auth/register", json={
             "email": "jamie@example.test", "username": "jamie",
-            "password": "Correct horse battery staple 4!", "display_name": "Jamie",
+            "password": "Correct horse battery staple 4!", "display_name": "Jamie", "accept_terms": True,
         })
         self.assertEqual(response.status_code, 202)
         self.assertNotIn("token", response.text.lower())
@@ -113,11 +116,11 @@ class AccountApiTests(unittest.TestCase):
         self.assertNotEqual(row["token_hash"], result["token"])
         self.assertEqual(self.client.get("/api/me", headers=self.auth(result["token"])).status_code, 200)
         duplicate_email = self.client.post("/api/auth/register", json={
-            "email": "JAMIE@example.test", "username": "other", "password": "Correct horse battery staple 4!", "display_name": "Other",
+            "email": "JAMIE@example.test", "username": "other", "password": "Correct horse battery staple 4!", "display_name": "Other", "accept_terms": True,
         })
         self.assertEqual(duplicate_email.status_code, 409)
         duplicate_username = self.client.post("/api/auth/register", json={
-            "email": "other@example.test", "username": "jamie", "password": "Correct horse battery staple 4!", "display_name": "Other",
+            "email": "other@example.test", "username": "jamie", "password": "Correct horse battery staple 4!", "display_name": "Other", "accept_terms": True,
         })
         self.assertEqual(duplicate_username.status_code, 409)
         self.client.post("/api/auth/logout", headers=self.auth(result["token"]))
@@ -126,11 +129,102 @@ class AccountApiTests(unittest.TestCase):
             "email": "JAMIE@example.test", "password": "Correct horse battery staple 4!",
         }).status_code, 200)
 
+    def test_registration_requires_terms_acceptance(self):
+        response = self.client.post("/api/auth/register", json={
+            "email": "no-consent@example.test",
+            "username": "noconsent",
+            "password": "Correct horse battery staple 4!",
+            "display_name": "No Consent",
+            "accept_terms": False,
+        })
+        self.assertEqual(response.status_code, 422)
+        with self.db.locked_connection() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM otp_challenges").fetchone()[0], 0)
+
+    def test_public_policy_and_account_deletion_pages_are_available(self):
+        for path, phrase in (
+            ("/privacy", "Privacy Policy"),
+            ("/terms", "Terms of Use"),
+            ("/account-deletion", "Request account deletion"),
+        ):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertIn(phrase, response.text)
+            self.assertIn("benefit19990@gmail.com", response.text)
+
+    def test_social_refresh_migrations_preserve_existing_account_and_activity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "legacy.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE users(
+                    id INTEGER PRIMARY KEY,email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO users(id,email,password_hash) VALUES(1,'old@example.test','hashed');
+                CREATE TABLE profiles(
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    display_name TEXT NOT NULL,bio TEXT NOT NULL DEFAULT '',
+                    interests TEXT NOT NULL DEFAULT '[]',recommendations_consent INTEGER NOT NULL DEFAULT 0,
+                    context_assistance_consent INTEGER NOT NULL DEFAULT 0,
+                    onboarding_completed INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO profiles(user_id,display_name) VALUES(1,'Existing member');
+                CREATE TABLE posts(
+                    id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    body TEXT NOT NULL,visibility TEXT NOT NULL DEFAULT 'public',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO posts(id,user_id,body) VALUES(1,1,'Keep this post');
+                CREATE TABLE replies(
+                    id INTEGER PRIMARY KEY,post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    body TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE notifications(
+                    id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('follow','reply','reaction')),
+                    post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,read_at TEXT
+                );
+                INSERT INTO notifications(id,user_id,actor_id,kind,post_id) VALUES(1,1,1,'reaction',1);
+                """
+            )
+            connection.close()
+            migrated = Database(path)
+            try:
+                user = migrated.profile_for(1)
+                self.assertEqual(user["display_name"], "Existing member")
+                self.assertEqual(user["username"], "member1")
+                with migrated.locked_connection() as upgraded:
+                    self.assertEqual(upgraded.execute(
+                        "SELECT body FROM posts WHERE id=1",
+                    ).fetchone()["body"], "Keep this post")
+                    self.assertEqual(upgraded.execute(
+                        "SELECT kind FROM notifications WHERE id=1",
+                    ).fetchone()["kind"], "reaction")
+                    self.assertIn(
+                        "activity_kind",
+                        {row["name"] for row in upgraded.execute("PRAGMA table_info(notifications)")},
+                    )
+                    self.assertEqual(
+                        upgraded.execute("SELECT COUNT(*) FROM push_tokens").fetchone()[0],
+                        0,
+                    )
+            finally:
+                if migrated._connection is not None:
+                    migrated._connection.close()
+
     def test_password_policy_applies_to_signup_and_reset_at_boundaries(self):
         registration = {
             "email": "policy@example.test",
             "username": "policy",
             "display_name": "Policy",
+            "accept_terms": True,
         }
         invalid_passwords = (
             "aB1",
@@ -298,7 +392,7 @@ class AccountApiTests(unittest.TestCase):
         client = TestClient(new_app(db, FailingMailer()))
         registration = client.post("/api/auth/register", json={
             "email": "valid@example.test", "username": "valid", "password": "Correct horse battery staple 4!",
-            "display_name": "Member",
+            "display_name": "Member", "accept_terms": True,
         })
         self.assertEqual(registration.status_code, 503)
         known = client.post("/api/auth/forgot-password", json={"email": "valid@example.test"})
@@ -321,7 +415,7 @@ class AccountApiTests(unittest.TestCase):
     def test_registration_wrong_code_attempt_limit_and_resend_invalidation(self):
         body = {
             "email": "jamie@example.test", "username": "jamie",
-            "password": "Correct horse battery staple 4!", "display_name": "Jamie",
+            "password": "Correct horse battery staple 4!", "display_name": "Jamie", "accept_terms": True,
         }
         with mock.patch("zorlii_app.main.secrets.randbelow", side_effect=[100001, 100002, 200002]):
             response = self.client.post("/api/auth/register", json=body)
@@ -353,7 +447,7 @@ class AccountApiTests(unittest.TestCase):
     def test_registration_otp_expiry_rejects_account_creation(self):
         body = {
             "email": "expired@example.test", "username": "expired",
-            "password": "Correct horse battery staple 4!", "display_name": "Expired",
+            "password": "Correct horse battery staple 4!", "display_name": "Expired", "accept_terms": True,
         }
         self.client.post("/api/auth/register", json=body)
         code = self.mailer.deliveries[-1]["code"]
@@ -372,7 +466,7 @@ class AccountApiTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ZORLII_OTP_SECRET": ""}):
             response = self.client.post("/api/auth/register", json={
                 "email": "member@example.test", "username": "member",
-                "password": "Correct horse battery staple 4!", "display_name": "Member",
+                "password": "Correct horse battery staple 4!", "display_name": "Member", "accept_terms": True,
             })
         self.assertEqual(response.status_code, 503)
         self.assertEqual(self.mailer.deliveries, [])
@@ -442,6 +536,95 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.patch(f"/api/conversations/{conv}/messages/{message_id}", headers=hb, json={"body": "changed"}).status_code, 404)
         self.assertEqual(self.client.patch(f"/api/conversations/{conv}/messages/{message_id}", headers=ha, json={"body": "Updated hello"}).status_code, 200)
 
+    def test_legacy_member_must_accept_terms_before_contributing(self):
+        with self.db.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users(email,username,password_hash) VALUES(?,?,?)",
+                ("legacy@example.test", "legacy", hash_password("oldpass")),
+            )
+            connection.execute(
+                "INSERT INTO profiles(user_id,display_name) VALUES(?,?)",
+                (cursor.lastrowid, "Legacy member"),
+            )
+        login = self.client.post("/api/auth/login", json={
+            "email": "legacy@example.test", "password": "oldpass",
+        }).json()
+        headers = self.auth(login["token"])
+        self.assertFalse(self.client.get("/api/me", headers=headers).json()["user"]["terms_accepted"])
+        self.assertEqual(self.client.post(
+            "/api/posts", headers=headers, json={"body": "Not accepted yet"},
+        ).status_code, 403)
+        accepted = self.client.post("/api/terms/accept", headers=headers, json={"accepted": True})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertTrue(accepted.json()["user"]["terms_accepted"])
+        self.assertEqual(self.client.post(
+            "/api/posts", headers=headers, json={"body": "Accepted"},
+        ).status_code, 201)
+
+    def test_reports_are_deduplicated_and_only_moderators_can_review(self):
+        reporter = self.register()
+        author = self.register("bob@example.test", "bob", "Bob")
+        author_headers = self.auth(author["token"])
+        post = self.client.post(
+            "/api/posts", headers=author_headers, json={"body": "A reported post"},
+        ).json()["post"]
+        report_payload = {
+            "target_type": "post", "target_id": post["id"],
+            "reason": "spam", "details": "This looks suspicious.",
+        }
+        reporter_headers = self.auth(reporter["token"])
+        report = self.client.post("/api/reports", headers=reporter_headers, json=report_payload)
+        self.assertEqual(report.status_code, 201, report.text)
+        self.assertEqual(self.client.post(
+            "/api/reports", headers=reporter_headers, json=report_payload,
+        ).status_code, 409)
+        self.assertEqual(self.client.get(
+            "/api/moderation/reports", headers=reporter_headers,
+        ).status_code, 403)
+        with mock.patch.dict(os.environ, {"ZORLII_MODERATOR_EMAILS": "jamie@example.test"}):
+            reports = self.client.get("/api/moderation/reports", headers=reporter_headers)
+            self.assertEqual(reports.status_code, 200, reports.text)
+            self.assertEqual(reports.json()["reports"][0]["id"], report.json()["id"])
+            reviewed = self.client.patch(
+                f"/api/moderation/reports/{report.json()['id']}",
+                headers=reporter_headers,
+                json={"status": "reviewed"},
+            )
+            self.assertEqual(reviewed.status_code, 200, reviewed.text)
+            self.assertEqual(self.client.get(
+                "/api/moderation/reports", headers=reporter_headers,
+            ).json()["reports"], [])
+
+    def test_block_hides_profiles_and_posts_and_prevents_private_messages(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        post = self.client.post(
+            "/api/posts", headers=hb, json={"body": "Bob's post"},
+        ).json()["post"]
+        conversation = self.client.post(
+            "/api/conversations", headers=ha, json={"username": "bob"},
+        ).json()["id"]
+        self.assertIn(post["id"], [
+            item["id"] for item in self.client.get("/api/feed", headers=ha).json()["posts"]
+        ])
+        self.assertEqual(self.client.post("/api/users/bob/block", headers=ha).json()["blocked"], True)
+        self.assertNotIn(post["id"], [
+            item["id"] for item in self.client.get("/api/feed", headers=ha).json()["posts"]
+        ])
+        self.assertEqual(self.client.get("/api/users/bob", headers=ha).status_code, 404)
+        self.assertEqual(self.client.get(
+            f"/api/conversations/{conversation}/messages", headers=ha,
+        ).status_code, 404)
+        self.assertEqual(self.client.post(
+            "/api/conversations", headers=ha, json={"username": "bob"},
+        ).status_code, 404)
+        self.assertEqual(self.client.get("/api/blocks", headers=ha).json()["users"][0]["username"], "bob")
+        self.assertEqual(self.client.post("/api/users/bob/block", headers=ha).json()["blocked"], False)
+        self.assertIn(post["id"], [
+            item["id"] for item in self.client.get("/api/feed", headers=ha).json()["posts"]
+        ])
+
     def test_profile_and_recommendations_have_real_data_only(self):
         alice = self.register()
         bob = self.register("bob@example.test", "bob", "Bob")
@@ -457,6 +640,143 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(result.json()["recommendations"][0]["username"], "bob")
         self.assertNotIn("sample", result.text.lower())
         self.assertEqual(self.client.post("/api/posts", headers=ha, json={"body": "   "}).status_code, 422)
+
+    def test_posts_support_quotes_reposts_and_activity_attribution(self):
+        author = self.register()
+        reposter = self.register("bob@example.test", "bob", "Bob")
+        follower = self.register("eve@example.test", "eve", "Eve")
+        ha, hb, he = map(self.auth, (author["token"], reposter["token"], follower["token"]))
+        post = self.client.post(
+            "/api/posts", headers=ha, json={"body": "The original post"},
+        ).json()["post"]
+        self.assertEqual(self.client.post(
+            "/api/users/bob/follow", headers=he,
+        ).status_code, 200)
+        repost = self.client.post(f"/api/posts/{post['id']}/repost", headers=hb)
+        self.assertEqual(repost.status_code, 200, repost.text)
+        self.assertTrue(repost.json()["reposted"])
+        reposted_post = next(
+            item for item in self.client.get("/api/feed?scope=following", headers=he).json()["posts"]
+            if item["id"] == post["id"]
+        )
+        self.assertEqual(reposted_post["repost_count"], 1)
+        self.assertEqual(reposted_post["reposted_by"]["username"], "bob")
+        quote = self.client.post("/api/posts", headers=hb, json={
+            "body": "Adding my thoughts", "quoted_post_id": post["id"],
+        })
+        self.assertEqual(quote.status_code, 201, quote.text)
+        self.assertEqual(quote.json()["post"]["quoted_post"]["body"], "The original post")
+        activities = self.client.get("/api/notifications", headers=ha).json()["notifications"]
+        self.assertEqual({item["kind"] for item in activities}, {"repost", "quote"})
+        self.assertEqual(
+            self.client.post(f"/api/posts/{post['id']}/repost", headers=hb).json(),
+            {"reposted": False},
+        )
+
+    def test_quote_cannot_expand_non_public_post_visibility(self):
+        author = self.register()
+        viewer = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(author["token"]), self.auth(viewer["token"])
+        post = self.client.post(
+            "/api/posts", headers=ha,
+            json={"body": "Followers only", "visibility": "followers"},
+        ).json()["post"]
+        self.assertEqual(self.client.post("/api/posts", headers=hb, json={
+            "quoted_post_id": post["id"], "body": "Can't see this yet",
+        }).status_code, 404)
+        self.client.post("/api/users/jamie/follow", headers=hb)
+        public_quote = self.client.post("/api/posts", headers=hb, json={
+            "quoted_post_id": post["id"], "body": "Cannot broaden the audience",
+        })
+        self.assertEqual(public_quote.status_code, 403)
+        private_quote = self.client.post("/api/posts", headers=hb, json={
+            "quoted_post_id": post["id"], "visibility": "private",
+        })
+        self.assertEqual(private_quote.status_code, 201, private_quote.text)
+
+    def test_replies_support_media_reactions_reposts_and_quotes(self):
+        author = self.register()
+        replier = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(author["token"]), self.auth(replier["token"])
+        post = self.client.post("/api/posts", headers=ha, json={"body": "Thread root"}).json()["post"]
+        reply_response = self.client.post(
+            f"/api/posts/{post['id']}/replies/media",
+            headers=hb,
+            data={"body": "A reply with a photo"},
+            files=[("media", ("reply.png", self.image_bytes(), "image/png"))],
+        )
+        self.assertEqual(reply_response.status_code, 201, reply_response.text)
+        reply = reply_response.json()
+        self.assertEqual(len(reply["media"]), 1)
+        media_response = self.client.get(reply["media"][0]["url"], headers=ha)
+        self.assertEqual(media_response.status_code, 200)
+        self.assertEqual(self.client.post(
+            f"/api/replies/{reply['id']}/reaction", headers=ha,
+        ).json(), {"reacted": True})
+        self.assertEqual(self.client.post(
+            f"/api/replies/{reply['id']}/repost", headers=ha,
+        ).json(), {"reposted": True})
+        details = self.client.get(f"/api/posts/{post['id']}", headers=ha).json()
+        self.assertEqual(details["replies"][0]["reaction_count"], 1)
+        self.assertEqual(details["replies"][0]["repost_count"], 1)
+        quote = self.client.post("/api/posts", headers=ha, json={
+            "body": "Quoting this reply", "quoted_reply_id": reply["id"],
+        })
+        self.assertEqual(quote.status_code, 201, quote.text)
+        self.assertEqual(quote.json()["post"]["quoted_reply"]["id"], reply["id"])
+        feed = self.client.get("/api/feed", headers=ha).json()["posts"]
+        self.assertTrue(any(item["reposted_reply"] for item in feed))
+        activities = self.client.get("/api/notifications", headers=hb).json()["notifications"]
+        self.assertEqual(
+            {item["kind"] for item in activities},
+            {"reply_reaction", "reply_repost", "quote"},
+        )
+        media_path = next(self.media_dir.glob("*.png"))
+        self.assertEqual(self.client.delete(
+            f"/api/replies/{reply['id']}", headers=hb,
+        ).status_code, 200)
+        self.assertFalse(media_path.exists())
+
+    def test_search_supports_display_names_and_at_usernames(self):
+        self.register("bob@example.test", "bob_smith", "Bob Smith")
+        viewer = self.register("eve@example.test", "eve", "Eve")
+        headers = self.auth(viewer["token"])
+        for query in ("Bob Smith", "@bob_smith", "bob_smith"):
+            result = self.client.get("/api/search", headers=headers, params={"q": query})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual([person["username"] for person in result.json()["people"]], ["bob_smith"])
+        self.assertEqual(
+            self.client.get("/api/search", headers=headers, params={"q": "@"}).status_code,
+            422,
+        )
+
+    def test_push_token_registration_and_activity_delivery(self):
+        author = self.register()
+        liker = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(author["token"]), self.auth(liker["token"])
+        push_token = "ExpoPushToken[0123456789abcdef01234567]"
+        registered = self.client.post("/api/push-token", headers=ha, json={
+            "token": push_token, "platform": "android",
+        })
+        self.assertEqual(registered.status_code, 204, registered.text)
+        post = self.client.post("/api/posts", headers=ha, json={"body": "Like me"}).json()["post"]
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"data":[{"status":"ok"}]}'
+        with mock.patch("zorlii_app.main.urlopen", return_value=response) as push_request:
+            liked = self.client.post(f"/api/posts/{post['id']}/reaction", headers=hb)
+        self.assertEqual(liked.status_code, 200, liked.text)
+        self.assertTrue(push_request.called)
+        payload = json.loads(push_request.call_args.args[0].data)
+        self.assertEqual(payload[0]["to"], push_token)
+        self.assertEqual(payload[0]["title"], "New like")
+        self.assertEqual(self.client.get("/api/notifications", headers=ha).json()[
+            "notifications"
+        ][0]["kind"], "reaction")
+        removed = self.client.request(
+            "DELETE", "/api/push-token", headers=ha,
+            json={"token": push_token, "platform": "android"},
+        )
+        self.assertEqual(removed.status_code, 204)
 
     def test_local_context_requires_saved_opt_in_and_per_request_confirmation(self):
         member = self.register()
