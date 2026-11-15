@@ -229,6 +229,22 @@ class Database:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS push_tokens_user ON push_tokens(user_id);
+                CREATE TABLE IF NOT EXISTS game_runs (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    game TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    PRIMARY KEY (user_id, game)
+                );
+                CREATE TABLE IF NOT EXISTS game_scores (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    game TEXT NOT NULL,
+                    score INTEGER NOT NULL CHECK (score >= 0),
+                    achieved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, game)
+                );
+                CREATE INDEX IF NOT EXISTS game_scores_ranking ON game_scores(game, score DESC, achieved_at, user_id);
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}

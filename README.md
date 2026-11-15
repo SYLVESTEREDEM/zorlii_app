@@ -46,6 +46,8 @@ Conversation history is returned newest-page-first, with messages ordered chrono
 Mentions in posts and replies create an Activity and schedule a push for each tagged account that can view the content; blocked accounts and private or otherwise inaccessible content do not receive mention alerts.
 The signed-in profile exposes activity totals for posts, attachments, replies, likes, echoes, saved posts and sent messages. Profile posts use `before_id` pagination and continue to respect the viewer's access to each post.
 
+The menu's Mini games section includes Tile Quest and Summit Steps. In Summit Steps, each climb requires a reachable hold within 12 seconds. Each game keeps one all-time best score per member; the leaderboard shows usernames, display names and scores to signed-in members, except across blocks. Games require an internet connection. Moves and scores are calculated on the server rather than accepted from clients; this does not prevent automated play. Game data is included in account deletion and export.
+
 Use Node.js 22.13 or newer for the current Expo SDK. An Android APK can be built locally with the Android SDK installed, or through EAS Build. The project includes `eas.json` profiles for an internal-test APK and a production Android App Bundle.
 
 1. Start the backend as above. Find the computer's private Wi-Fi IPv4 address (for example with `ipconfig`).
@@ -90,6 +92,7 @@ EAS requires Expo authentication and Android signing credentials; it can generat
 - `POST /api/auth/register`, `/register/resend`, `/register/verify`, `/login`, `/logout`, `/forgot-password`, `/reset-password`; `/api/me`
 - `GET/PATCH /api/profile`; `PUT/DELETE /api/profile/avatar`; `GET /api/avatars/{user_id}`; `GET /api/users/{username}`, `/posts`, `/followers`, and `/following`; `POST /api/users/{username}/follow`
 - `GET /api/hashtags/{tag}` returns posts with the exact hashtag, ignoring case and respecting post visibility and blocks. Use `before_id` to load older results. Hashtags contain letters, numbers, or underscores (up to 100 characters).
+- `GET /api/games` lists games; `POST /api/games/{game}/start` starts a run; `GET /api/games/{game}/run` retrieves the current run; `POST /api/games/{game}/move` advances it with its `run_id`, `revision`, and action. `GET /api/games/{game}/leaderboard` returns ranked personal bests with `limit` and `offset`. Runs end after 1,000 moves at most.
 - `PATCH /api/settings/theme` stores the signed-in member's accent colour as a six-digit hex value in `theme_color`, so it is available through the profile across devices. The startup migration adds this preference without replacing existing account data.
 - `GET /api/blocks`; `POST /api/users/{username}/block` toggles a block; `POST /api/reports` submits a post or account report. Moderator-only report review and reported-post removal use `/api/moderation/*`.
 - `GET /api/feed?scope=all|following|bookmarks`; `POST /api/posts` supports quotes; `/api/posts/media` supports quoted posts with uploaded media; post reposts, reply reactions/reposts, and reply media use the `/api/posts/*` and `/api/replies/*` routes.

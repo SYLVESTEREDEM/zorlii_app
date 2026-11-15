@@ -11,6 +11,7 @@ import * as Device from "expo-device";
 import { VideoView, useVideoPlayer } from "expo-video";
 import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
+import Games from "./Games";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 Notifications.setNotificationHandler({
@@ -1256,6 +1257,7 @@ function AppContent() {
   </View>;
 
   function renderBody() {
+    if (screen === "games") return <Games apiUrl={API_URL} token={token} openProfile={username => { void openPublicProfile(username); }} />;
     if (screen === "terms") return <View style={styles.form}>
       <Text style={styles.title}>A quick community update</Text>
       <Text style={styles.copy}>To continue using Zorlii, confirm that you are at least 18 and accept the Terms of Use and Privacy Policy.</Text>
@@ -1764,6 +1766,7 @@ function AppContent() {
             {menuButton("Explore", () => setScreen("explore"))}
             {menuButton("Inbox", () => { void loadInbox(); })}
             {menuButton(`Activities${unreadNotifications ? ` · ${unreadNotifications} unread` : ""}`, () => { setScreen("notifications"); void loadNotifications(); })}
+            {menuButton("Mini games", () => setScreen("games"))}
             {menuButton("Your profile", () => { void loadProfile(); })}
             {menuButton("Settings & profile tools", () => { void loadSettings(); })}
             {me?.is_moderator ? menuButton("Moderator reports", () => { setScreen("moderation"); void loadModerationReports(); }) : null}

@@ -18,6 +18,7 @@ os.environ["ZORLII_DB_PATH"] = ":memory:"
 from fastapi.testclient import TestClient
 
 from zorlii_app.db import Database
+from zorlii_app import games
 from zorlii_app.main import OTP_EMAIL_LIMIT, new_app, otp_digest
 from zorlii_app.security import hash_password, token_digest
 
@@ -155,6 +156,72 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.patch("/api/settings/theme", headers=first_auth, json={"theme_color": "red"}).status_code, 422)
         self.client.cookies.clear()
         self.assertEqual(self.client.patch("/api/settings/theme", json={"theme_color": "#123456"}).status_code, 401)
+
+    def test_game_scores_are_server_calculated_ranked_and_account_owned(self):
+        first = self.register()
+        second = self.register("other@example.test", "other", "Other")
+        first_auth, second_auth = self.auth(first["token"]), self.auth(second["token"])
+        self.assertEqual(len(self.client.get("/api/games", headers=first_auth).json()["games"]), 2)
+        self.assertEqual(self.client.post("/api/games/no-such-game/start", headers=first_auth).status_code, 404)
+        with mock.patch("zorlii_app.games._holds", return_value=[0, 1, 2]):
+            run = self.client.post("/api/games/summit-steps/start", headers=first_auth).json()
+            payload = {"run_id": run["run_id"], "revision": 0, "action": "center"}
+            self.assertEqual(self.client.post("/api/games/summit-steps/move", headers=second_auth, json=payload).status_code, 409)
+            self.assertEqual(self.client.post("/api/games/summit-steps/move", headers=first_auth, json={**payload, "score": 999999}).status_code, 422)
+            result = self.client.post("/api/games/summit-steps/move", headers=first_auth, json=payload)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["state"]["score"], 10)
+            resumed = self.client.get("/api/games/summit-steps/run", headers=first_auth).json()["run"]
+            self.assertEqual(resumed["run_id"], run["run_id"])
+            self.assertEqual(resumed["revision"], 1)
+            self.assertEqual(resumed["state"]["score"], 10)
+            self.assertEqual(self.client.post("/api/games/summit-steps/move", headers=first_auth, json=payload).status_code, 409)
+            other = self.client.post("/api/games/summit-steps/start", headers=second_auth).json()
+            for revision in range(2):
+                result = self.client.post("/api/games/summit-steps/move", headers=second_auth,
+                    json={"run_id": other["run_id"], "revision": revision, "action": "center"})
+                self.assertEqual(result.status_code, 200, result.text)
+            fresh = self.client.post("/api/games/summit-steps/start", headers=second_auth).json()
+            self.client.post("/api/games/summit-steps/move", headers=second_auth,
+                json={"run_id": fresh["run_id"], "revision": 0, "action": "center"})
+        page = self.client.get("/api/games/summit-steps/leaderboard?limit=1", headers=first_auth).json()
+        self.assertEqual([(entry["username"], entry["score"]) for entry in page["scores"]], [("other", 20)])
+        self.assertTrue(page["has_more"])
+        page = self.client.get("/api/games/summit-steps/leaderboard?limit=1&offset=1", headers=first_auth).json()
+        self.assertEqual(page["scores"][0]["score"], 10)
+        self.assertFalse(page["has_more"])
+        self.assertEqual(self.client.get("/api/games/tile-quest/leaderboard", headers=first_auth).json()["scores"], [])
+        exported = self.client.get("/api/account/export", headers=first_auth).json()
+        self.assertEqual(exported["game_scores"][0]["score"], 10)
+        self.assertEqual(exported["game_progress"][0]["state"]["score"], 10)
+        self.assertEqual(self.client.post("/api/users/other/block", headers=first_auth).status_code, 200)
+        self.assertEqual(len(self.client.get("/api/games/summit-steps/leaderboard", headers=first_auth).json()["scores"]), 1)
+        self.assertEqual(self.client.request("DELETE", "/api/account", headers=second_auth,
+            json={"password": "Correct horse battery staple 4!"}).status_code, 200)
+        with self.db.locked_connection() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM game_scores").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM game_runs").fetchone()[0], 1)
+
+    def test_game_rules_merge_once_and_end_an_invalid_climb(self):
+        state = {"board": [[2, 2, 2, 2], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], "score": 0, "over": False}
+        with mock.patch("zorlii_app.games._add_tile"):
+            result = games.move("tile-quest", state, "left")
+        self.assertEqual(result["board"][0], [4, 4, 0, 0])
+        self.assertEqual(result["score"], 8)
+        climb = {"lane": 0, "holds": [2], "score": 30, "over": False, "deadline": time.time() + 12}
+        result = games.move("summit-steps", climb, "right")
+        self.assertTrue(result["over"])
+        self.assertEqual(result["score"], 30)
+        with self.assertRaises(ValueError):
+            games.move("summit-steps", result, "left")
+        with mock.patch("zorlii_app.games.time.time", return_value=100):
+            expired = games.move("summit-steps", {"lane": 1, "holds": [1], "score": 20,
+                                                  "over": False, "deadline": 99}, "center")
+        self.assertTrue(expired["over"])
+        self.assertEqual(expired["score"], 20)
+        for lane in range(3):
+            for _ in range(30):
+                self.assertTrue(any(abs(hold - lane) <= 1 for hold in games._holds(lane)))
 
     def test_public_policy_and_account_deletion_pages_are_available(self):
         for path, phrase in (

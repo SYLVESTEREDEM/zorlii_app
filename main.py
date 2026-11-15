@@ -27,6 +27,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from .context_assistance import extractive_context
 from .db import Database
 from .email_delivery import EmailConfigurationError, mailer_from_env
+from . import games
 from .recommendations import recommend
 from .security import hash_password, new_session_token, token_digest, verify_password
 
@@ -178,6 +179,13 @@ class LoginInput(BaseModel):
     @classmethod
     def normalize_email(cls, value):
         return value.strip().lower()
+
+
+class GameMoveInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str = Field(min_length=32, max_length=32)
+    revision: int = Field(ge=0)
+    action: str = Field(min_length=1, max_length=10)
 
 
 class ForgotInput(BaseModel):
@@ -435,6 +443,91 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             ).fetchone()
         if row is None or not row["terms_accepted_at"]:
             raise HTTPException(status_code=403, detail="Accept the Terms of Use before contributing content.")
+
+    def require_game(game):
+        if game not in games.GAMES:
+            raise HTTPException(status_code=404, detail="Game not found.")
+
+    @app.get("/api/games")
+    def list_games(user: User):
+        return {"games": [{"id": key, **value} for key, value in games.GAMES.items()]}
+
+    @app.get("/api/games/{game}/leaderboard")
+    def game_leaderboard(game: str, user: User, limit: int = Query(25, ge=1, le=100),
+                         offset: int = Query(0, ge=0)):
+        require_game(game)
+        with db.locked_connection() as connection:
+            rows = connection.execute(
+                """SELECT u.username,p.display_name,s.score,s.achieved_at
+                   FROM game_scores s JOIN users u ON u.id=s.user_id
+                   JOIN profiles p ON p.user_id=u.id
+                   WHERE s.game=? AND NOT EXISTS (
+                       SELECT 1 FROM blocked_users b
+                       WHERE (b.blocker_id=? AND b.blocked_id=s.user_id)
+                          OR (b.blocker_id=s.user_id AND b.blocked_id=?)
+                   )
+                   ORDER BY s.score DESC,s.achieved_at ASC,s.user_id ASC
+                   LIMIT ? OFFSET ?""",
+                (game, user["id"], user["id"], limit + 1, offset),
+            ).fetchall()
+        return {"scores": [dict(row) for row in rows[:limit]], "has_more": len(rows) > limit}
+
+    @app.post("/api/games/{game}/start")
+    def start_game(game: str, user: User):
+        require_game(game)
+        require_terms_accepted(user["id"])
+        state = games.start(game)
+        run_id = secrets.token_hex(16)
+        with db.transaction() as connection:
+            connection.execute(
+                """INSERT INTO game_runs(user_id,game,run_id,revision,state) VALUES(?,?,?,0,?)
+                   ON CONFLICT(user_id,game) DO UPDATE SET run_id=excluded.run_id,revision=0,state=excluded.state""",
+                (user["id"], game, run_id, json.dumps(state)),
+            )
+        return {"run_id": run_id, "revision": 0, "state": state, "server_time": time.time()}
+
+    @app.get("/api/games/{game}/run")
+    def current_game(game: str, user: User):
+        require_game(game)
+        with db.locked_connection() as connection:
+            row = connection.execute(
+                "SELECT run_id,revision,state FROM game_runs WHERE user_id=? AND game=?",
+                (user["id"], game),
+            ).fetchone()
+        return {"run": {"run_id": row["run_id"], "revision": row["revision"],
+                        "state": json.loads(row["state"]), "server_time": time.time()} if row else None}
+
+    @app.post("/api/games/{game}/move")
+    def move_game(game: str, data: GameMoveInput, user: User):
+        require_game(game)
+        require_terms_accepted(user["id"])
+        with db.transaction() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT run_id,revision,state FROM game_runs WHERE user_id=? AND game=?",
+                (user["id"], game),
+            ).fetchone()
+            if row is None or row["run_id"] != data.run_id or row["revision"] != data.revision:
+                raise HTTPException(status_code=409, detail="This game is out of date. Reopen it to resume.")
+            try:
+                state = games.move(game, json.loads(row["state"]), data.action)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            revision = data.revision + 1
+            if revision >= 1000:
+                state["over"] = True
+            connection.execute(
+                "UPDATE game_runs SET revision=?,state=? WHERE user_id=? AND game=?",
+                (revision, json.dumps(state), user["id"], game),
+            )
+            if state["score"] > 0 or state["over"]:
+                connection.execute(
+                    """INSERT INTO game_scores(user_id,game,score) VALUES(?,?,?)
+                       ON CONFLICT(user_id,game) DO UPDATE SET score=excluded.score,achieved_at=CURRENT_TIMESTAMP
+                       WHERE excluded.score>game_scores.score""",
+                    (user["id"], game, state["score"]),
+                )
+        return {"run_id": data.run_id, "revision": revision, "state": state, "server_time": time.time()}
 
     def is_blocked(connection, user_id, other_user_id):
         return bool(connection.execute(
@@ -1415,6 +1508,14 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                    WHERE n.user_id=? ORDER BY n.id""",
                 (user["id"],),
             ).fetchall()
+            game_scores = connection.execute(
+                "SELECT game,score,achieved_at FROM game_scores WHERE user_id=? ORDER BY game",
+                (user["id"],),
+            ).fetchall()
+            game_runs = connection.execute(
+                "SELECT game,revision,state FROM game_runs WHERE user_id=? ORDER BY game",
+                (user["id"],),
+            ).fetchall()
         export = {
             "account": profile_data,
             "posts": exported_posts,
@@ -1425,6 +1526,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             "following": [dict(row) for row in following],
             "conversations": conversations,
             "notifications_received": [dict(row) for row in notifications],
+            "game_scores": [dict(row) for row in game_scores],
+            "game_progress": [{"game": row["game"], "revision": row["revision"], "state": json.loads(row["state"])} for row in game_runs],
         }
         return Response(
             content=json.dumps(export, ensure_ascii=False, indent=2),
