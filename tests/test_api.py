@@ -520,6 +520,39 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/posts/{public.json()['post']['id']}", headers=headers_bob).status_code, 404)
         self.assertEqual(self.client.delete(f"/api/posts/{public.json()['post']['id']}", headers=headers_alice).status_code, 200)
 
+    def test_hashtags_match_whole_tags_and_respect_visibility(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        def post(body, visibility="public"):
+            return self.client.post("/api/posts", headers=ha, json={
+                "body": body, "visibility": visibility,
+            }).json()["post"]["id"]
+
+        first = post("Hello #Music!")
+        post("#musical and inside#music and ##music")
+        private = post("#music private", "private")
+        followers = post("#MUSIC followers", "followers")
+        last = post("#music public")
+        page = self.client.get("/api/hashtags/music?limit=1", headers=hb).json()
+        self.assertEqual([p["id"] for p in page["posts"]], [last])
+        self.assertTrue(page["has_more"])
+        page = self.client.get(f"/api/hashtags/MUSIC?limit=1&before_id={last}", headers=hb).json()
+        self.assertEqual([p["id"] for p in page["posts"]], [first])
+        self.assertFalse(page["has_more"])
+        self.client.post("/api/users/jamie/follow", headers=hb)
+        visible = self.client.get("/api/hashtags/music", headers=hb).json()["posts"]
+        self.assertEqual([p["id"] for p in visible], [last, followers, first])
+        self.assertNotIn(private, [p["id"] for p in visible])
+        self.client.post("/api/users/jamie/block", headers=hb)
+        self.assertEqual(self.client.get("/api/hashtags/music", headers=hb).json()["posts"], [])
+        self.assertEqual(self.client.get("/api/hashtags/music!", headers=ha).status_code, 422)
+        international = post("A #Café moment")
+        self.assertEqual(
+            self.client.get("/api/hashtags/café", headers=ha).json()["posts"][0]["id"],
+            international,
+        )
+
     def test_follower_visibility_and_private_messaging_participant_access(self):
         alice = self.register()
         bob = self.register("bob@example.test", "bob", "Bob")
@@ -540,6 +573,9 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(
             "/api/users/unknown/followers", headers=ha,
         ).status_code, 404)
+        self.client.post("/api/users/bob/block", headers=he)
+        self.assertEqual(self.client.get("/api/users/jamie", headers=he).json()["user"]["follower_count"], 0)
+        self.assertEqual(self.client.get("/api/users/jamie/followers", headers=he).json()["count"], 0)
         self.assertEqual(self.client.get("/api/posts/" + str(post["id"]), headers=hb).status_code, 200)
         conv = self.client.post("/api/conversations", headers=ha, json={"username": "bob"}).json()["id"]
         message = self.client.post(f"/api/conversations/{conv}/messages", headers=ha, json={"body": "Hello"})

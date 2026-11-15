@@ -33,6 +33,7 @@ type Conversation = { id: number; created_at?: string; last_message?: string; pa
 type DirectMessage = { id: number; body: string; created_at: string; sender_id: number; author: Author };
 type PublicProfile = Author & { bio: string; following: boolean; follower_count: number; following_count: number; joined_at?: string | null; created_at?: string | null };
 type Member = { id: number; username: string; display_name: string; bio: string; avatar_url?: string | null };
+type SocialKind = "followers" | "following";
 type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction" | "repost" | "quote" | "message" | "reply_reaction" | "reply_repost" | "mention"; post_id: number | null; reply_id?: number | null; created_at: string; read: boolean; actor: Author };
 type QuoteTarget = { type: "post" | "reply"; item: Post | Reply };
 type NativeFilePart = { uri: string; name: string; type: string };
@@ -183,6 +184,8 @@ function AppContent() {
   const profileUserRef = useRef<number | null>(null);
   const profileLoadedOlderRef = useRef(false);
   const publicProfileLoadedOlderRef = useRef(false);
+  const socialListRequestRef = useRef(0);
+  const hashtagRequestRef = useRef(0);
   const [token, setToken] = useState("");
   const [me, setMe] = useState<User | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -208,8 +211,12 @@ function AppContent() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
-  const [followers, setFollowers] = useState<Member[]>([]);
-  const [following, setFollowing] = useState<Member[]>([]);
+  const [socialList, setSocialList] = useState<{ username: string; kind: SocialKind; users: Member[]; count: number } | null>(null);
+  const [socialListLoading, setSocialListLoading] = useState(false);
+  const [hashtag, setHashtag] = useState("");
+  const [hashtagPosts, setHashtagPosts] = useState<Post[]>([]);
+  const [hashtagHasMore, setHashtagHasMore] = useState(false);
+  const [hashtagLoading, setHashtagLoading] = useState(false);
   const [blockedUsers, setBlockedUsers] = useState<Member[]>([]);
   const [followerCount, setFollowerCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
@@ -300,7 +307,7 @@ function AppContent() {
       loadProfile();
       return;
     }
-    profileReturnScreenRef.current = screen.startsWith("social-") ? profileReturnScreenRef.current : screen;
+    profileReturnScreenRef.current = screen === "social-profile" ? profileReturnScreenRef.current : screen;
     const sameProfile = publicProfileUsernameRef.current === username.toLowerCase();
     publicProfileUsernameRef.current = username.toLowerCase();
     setPublicProfile(null);
@@ -351,18 +358,52 @@ function AppContent() {
     } catch (e) { fail(e); }
     finally { setBusy(false); }
   }
+  async function openSocialList(username: string, kind: SocialKind, offset = 0) {
+    const requestId = offset ? socialListRequestRef.current : ++socialListRequestRef.current;
+    if (!offset) {
+      setSocialList({ username, kind, users: [], count: 0 });
+      setScreen(`social-${kind}`);
+    }
+    setSocialListLoading(true);
+    setError("");
+    try {
+      const data = await request(`/api/users/${encodeURIComponent(username)}/${kind}?limit=30&offset=${offset}`);
+      if (requestId !== socialListRequestRef.current) return;
+      setSocialList(current => ({ username, kind, users: offset && current ? [...current.users, ...data.users] : data.users, count: data.count }));
+    } catch (e) { if (requestId === socialListRequestRef.current) fail(e); }
+    finally { if (requestId === socialListRequestRef.current) setSocialListLoading(false); }
+  }
+  async function openHashtag(tag: string, beforeId?: number) {
+    const requestId = beforeId ? hashtagRequestRef.current : ++hashtagRequestRef.current;
+    if (!beforeId) {
+      setHashtag(tag);
+      setHashtagPosts([]);
+      setHashtagHasMore(false);
+      setScreen("hashtag");
+    }
+    setHashtagLoading(true);
+    setError("");
+    try {
+      const data = await request(`/api/hashtags/${encodeURIComponent(tag)}${beforeId ? `?before_id=${beforeId}` : ""}`);
+      if (requestId !== hashtagRequestRef.current) return;
+      setHashtagPosts(current => beforeId ? [...current, ...data.posts] : data.posts);
+      setHashtagHasMore(Boolean(data.has_more) && data.posts.length > 0);
+    } catch (e) { if (requestId === hashtagRequestRef.current) fail(e); }
+    finally { if (requestId === hashtagRequestRef.current) setHashtagLoading(false); }
+  }
   function taggedText(body: string) {
     const parts: React.ReactNode[] = [];
-    const mentionPattern = /(^|[^A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])/gi;
+    const mentionPattern = /(^|[^A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])|(^|[^\p{L}\p{N}_#@])#([\p{L}\p{N}_]{1,100})(?![\p{L}\p{N}_])/gu;
     let cursor = 0;
     let match: RegExpExecArray | null;
     while ((match = mentionPattern.exec(body)) !== null) {
-      const mentionStart = match.index + match[1].length;
+      const mentionStart = match.index + (match[1] || match[3] || "").length;
       if (mentionStart > cursor) parts.push(body.slice(cursor, mentionStart));
-      const username = match[2];
-      parts.push(<Text key={`${mentionStart}-${username}`} accessibilityRole="link"
-        accessibilityLabel={`View @${username}'s profile`} style={[styles.mention, { color: readableAccent(activeThemeAccent) }]}
-        onPress={() => { void openPublicProfile(username); }}>@{username}</Text>);
+      const username = match[2], tag = match[4];
+      parts.push(<Text key={`${mentionStart}-${username || tag}`} accessibilityRole="link"
+        accessibilityLabel={username ? `View @${username}'s profile` : `View posts tagged #${tag}`}
+        style={[styles.mention, { color: readableAccent(activeThemeAccent) }]}
+        onPress={() => { if (username) void openPublicProfile(username); else void openHashtag(tag); }}>{username ? `@${username}` : `#${tag}`}</Text>);
       cursor = mentionPattern.lastIndex;
     }
     if (cursor < body.length) parts.push(body.slice(cursor));
@@ -411,8 +452,8 @@ function AppContent() {
     try {
       const [postData, followerData, followingData, blockData, meData] = await Promise.all([
         request(`/api/users/${me.username}/posts`),
-        request(`/api/users/${me.username}/followers`),
-        request(`/api/users/${me.username}/following`),
+        request(`/api/users/${me.username}/followers?limit=1`),
+        request(`/api/users/${me.username}/following?limit=1`),
         request("/api/blocks"),
         request("/api/me"),
       ]);
@@ -423,8 +464,6 @@ function AppContent() {
       }
       updateMe(meData.user);
       setActivityCounts(meData.user.activity_counts || null);
-      setFollowers(followerData.users);
-      setFollowing(followingData.users);
       setBlockedUsers(blockData.users);
       setFollowerCount(followerData.count);
       setFollowingCount(followingData.count);
@@ -640,6 +679,12 @@ function AppContent() {
     finally { setLoadingOlderMessages(false); }
   }
   function resetConversationState() {
+    socialListRequestRef.current++;
+    hashtagRequestRef.current++;
+    setSocialList(null);
+    setHashtag("");
+    setHashtagPosts([]);
+    setHashtagHasMore(false);
     activeConversationIdRef.current = null;
     messagesRef.current = [];
     setConversationId(null);
@@ -928,7 +973,13 @@ function AppContent() {
     );
   }
   async function togglePost(post: Post, action: "reaction" | "bookmark" | "repost") {
-    try { await request(`/api/posts/${post.id}/${action}`, "POST"); await loadFeed(); }
+    try {
+      await request(`/api/posts/${post.id}/${action}`, "POST");
+      if (screen === "hashtag") {
+        const result = await request(`/api/posts/${post.id}`);
+        setHashtagPosts(current => current.map(item => item.id === post.id ? result.post : item));
+      } else await loadFeed();
+    }
     catch (e) { fail(e); }
   }
   async function toggleReply(reply: Reply, action: "reaction" | "repost") {
@@ -1347,6 +1398,10 @@ function AppContent() {
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={styles.title}>{publicProfile.display_name}</Text>
             {profileLink(publicProfile.username, `@${publicProfile.username}`, styles.handle)}
+            <View style={styles.row}>
+              <Pressable accessibilityRole="button" accessibilityLabel={`${publicProfile.follower_count} followers`} style={styles.countCard} onPress={() => { void openSocialList(publicProfile.username, "followers"); }}><Text style={styles.countValue}>{publicProfile.follower_count}</Text><Text style={styles.countLabel}>Followers</Text></Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel={`${publicProfile.following_count} following`} style={styles.countCard} onPress={() => { void openSocialList(publicProfile.username, "following"); }}><Text style={styles.countValue}>{publicProfile.following_count}</Text><Text style={styles.countLabel}>Following</Text></Pressable>
+            </View>
             {formatJoinedDate(publicProfile.joined_at || publicProfile.created_at) ? <Text style={[styles.handle, { marginTop: 4 }]}>{formatJoinedDate(publicProfile.joined_at || publicProfile.created_at)}</Text> : null}
           </View>
         </View>
@@ -1354,8 +1409,6 @@ function AppContent() {
         <Text style={styles.copy}>{publicProfile.bio || "A Zorlii member."}</Text>
         <View style={styles.row}>
           <View style={styles.countCard}><Text style={styles.countValue}>{publicProfilePosts.length}</Text><Text style={styles.countLabel}>Loaded posts</Text></View>
-          <View style={styles.countCard}><Text style={styles.countValue}>{publicProfile.follower_count}</Text><Text style={styles.countLabel}>Followers</Text></View>
-          <View style={styles.countCard}><Text style={styles.countValue}>{publicProfile.following_count}</Text><Text style={styles.countLabel}>Following</Text></View>
         </View>
         <View style={styles.row}>
           {button("Message", () => startConversation(publicProfile.username), true)}
@@ -1374,19 +1427,32 @@ function AppContent() {
     </View>;
     if (screen === "social-followers" || screen === "social-following") {
       const isFollowers = screen === "social-followers";
-      const people = isFollowers ? followers : following;
+      const people = socialList?.users || [];
+      const owner = socialList?.username || me?.username || "";
       return <View>
-        {button("‹ Profile", loadProfile, true)}
+        {button("‹ Profile", () => { if (owner.toLowerCase() === me?.username.toLowerCase()) void loadProfile(); else void openPublicProfile(owner); }, true)}
         <Text style={styles.title}>{isFollowers ? "Followers" : "Following"}</Text>
-        <Text style={styles.copy}>{isFollowers ? `${followerCount} members follow you.` : `${followingCount} members you follow.`}</Text>
+        <Text style={styles.copy}>@{owner} · {socialList?.count ?? 0} {isFollowers ? "followers" : "following"}</Text>
         {people.map(person => <View key={person.id} style={styles.memberRow}>
           <Avatar user={person} size={40} onPress={profilePhotoAction(person)} />
           <View style={styles.memberIdentity}>{profileLink(person.username, person.display_name)}{profileLink(person.username, `@${person.username}`, styles.handle)}</View>
           {button("Message", () => startConversation(person.username), true)}
         </View>)}
-        {!people.length ? <View style={styles.empty}><Text style={styles.section}>{isFollowers ? "No followers yet" : "Not following anyone yet"}</Text><Text style={styles.copy}>Member lists will appear here as your community grows.</Text></View> : null}
+        {socialListLoading ? <ActivityIndicator color={safeAccent} /> : null}
+        {!socialListLoading && !people.length && !error ? <View style={styles.empty}><Text style={styles.section}>{isFollowers ? "No followers yet" : "Not following anyone yet"}</Text><Text style={styles.copy}>Member lists will appear here as your community grows.</Text></View> : null}
+        {!socialListLoading && socialList && people.length < socialList.count && people.length > 0
+          ? button("Load more members", () => openSocialList(owner, socialList.kind, people.length), true) : null}
       </View>;
     }
+    if (screen === "hashtag") return <View>
+      <Text style={styles.eyebrow}>Explore conversations</Text><Text style={styles.title}>#{hashtag}</Text>
+      <Text style={styles.copy}>Posts with this hashtag.</Text>
+      {hashtagPosts.map(post => postCard(post))}
+      {hashtagLoading ? <ActivityIndicator color={safeAccent} /> : null}
+      {!hashtagLoading && !hashtagPosts.length && !error ? <Text style={styles.copy}>No posts with this hashtag yet.</Text> : null}
+      {!hashtagLoading && hashtagHasMore && hashtagPosts.length
+        ? button("Load older posts", () => openHashtag(hashtag, hashtagPosts[hashtagPosts.length - 1].id), true) : null}
+    </View>;
     if (screen === "blocked") return <View>
       {button("‹ Profile", loadProfile, true)}
       <Text style={styles.title}>Blocked accounts</Text>
@@ -1504,6 +1570,10 @@ function AppContent() {
         <View style={{ flex: 1, minWidth: 0 }}>
           {me?.username ? profileLink(me.username, me.display_name || "Your profile", styles.title) : <Text style={styles.title}>Your profile</Text>}
           {me?.username ? profileLink(me.username, `@${me.username}`, styles.handle) : null}
+          <View style={styles.row}>
+            <Pressable accessibilityRole="button" accessibilityLabel={`${followerCount} followers`} style={styles.countCard} onPress={() => { if (me) void openSocialList(me.username, "followers"); }}><Text style={styles.countValue}>{followerCount}</Text><Text style={styles.countLabel}>Followers</Text></Pressable>
+            <Pressable accessibilityRole="button" accessibilityLabel={`${followingCount} following`} style={styles.countCard} onPress={() => { if (me) void openSocialList(me.username, "following"); }}><Text style={styles.countValue}>{followingCount}</Text><Text style={styles.countLabel}>Following</Text></Pressable>
+          </View>
           {formatJoinedDate(me?.joined_at || me?.created_at) ? <Text style={[styles.handle, { marginTop: 4 }]}>{formatJoinedDate(me?.joined_at || me?.created_at)}</Text> : null}
         </View>
       </View>
@@ -1511,8 +1581,6 @@ function AppContent() {
       <Text style={styles.copy}>{me?.bio || "Add a little about you to help others get to know you."}</Text>
       <View style={styles.row}>
         <View style={styles.countCard}><Text style={styles.countValue}>{activityCounts?.posts ?? "—"}</Text><Text style={styles.countLabel}>Posts</Text></View>
-        <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-followers")}><Text style={styles.countValue}>{followerCount}</Text><Text style={styles.countLabel}>Followers</Text></Pressable>
-        <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-following")}><Text style={styles.countValue}>{followingCount}</Text><Text style={styles.countLabel}>Following</Text></Pressable>
       </View>
       <View style={styles.activityGrid}>
         {(["media", "replies", "likes", "echoes", "saved", "messages"] as const).map(key => <View key={key} style={[styles.countCard, styles.activityMetric]}>

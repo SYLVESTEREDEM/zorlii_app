@@ -45,6 +45,7 @@ OTP_RATE_WINDOW = 60 * 60
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,24}$")
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])")
+HASHTAG_RE = re.compile(r"(?<![\w#@])#(\w{1,100})(?!\w)")
 PASSWORD_RE = re.compile(r"^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9\s])")
 DB = Database()
 LOGGER = logging.getLogger("zorlii.recovery")
@@ -1506,12 +1507,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             result["following"] = bool(connection.execute(
                 "SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?", (user["id"], row["id"])
             ).fetchone())
-            result["follower_count"] = connection.execute(
-                "SELECT COUNT(*) FROM follows WHERE followed_id=?", (row["id"],)
-            ).fetchone()[0]
-            result["following_count"] = connection.execute(
-                "SELECT COUNT(*) FROM follows WHERE follower_id=?", (row["id"],)
-            ).fetchone()[0]
+            result["follower_count"] = relationship_list(username, "followers", 1, 0, user["id"])["count"]
+            result["following_count"] = relationship_list(username, "following", 1, 0, user["id"])["count"]
         return {"user": result}
 
     @app.get("/api/users/{username}/posts")
@@ -2310,6 +2307,42 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 connection.execute("INSERT INTO bookmarks(user_id,post_id) VALUES(?,?)", (user["id"], post_id))
                 saved = True
         return {"bookmarked": saved}
+
+    @app.get("/api/hashtags/{tag}")
+    def hashtag_posts(
+        tag: str,
+        user: User,
+        limit: int = Query(default=30, ge=1, le=100),
+        before_id: int | None = Query(default=None, ge=1),
+    ):
+        if not re.fullmatch(r"\w{1,100}", tag):
+            raise HTTPException(status_code=422, detail="Invalid hashtag.")
+        normalized = tag.casefold()
+        with db.locked_connection() as connection:
+            connection.create_function(
+                "hashtag_matches", 2,
+                lambda body, requested: int(any(
+                    match.group(1).casefold() == requested
+                    for match in HASHTAG_RE.finditer(body)
+                )),
+                deterministic=True,
+            )
+            ids = connection.execute(
+                """SELECT p.id FROM posts p
+                   WHERE (? IS NULL OR p.id<?) AND hashtag_matches(p.body, ?) AND
+                     (p.user_id=? OR p.visibility='public' OR
+                      (p.visibility='followers' AND EXISTS(
+                         SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id)))
+                     AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                         WHERE (b.blocker_id=? AND b.blocked_id=p.user_id)
+                            OR (b.blocker_id=p.user_id AND b.blocked_id=?))
+                   ORDER BY p.id DESC LIMIT ?""",
+                (before_id, before_id, normalized, user["id"], user["id"],
+                 user["id"], user["id"], limit + 1),
+            ).fetchall()
+            posts = [post_payload(row) for item in ids[:limit]
+                     if (row := visible_post(connection, item["id"], user["id"])) is not None]
+        return {"tag": tag, "posts": posts, "has_more": len(ids) > limit}
 
     @app.get("/api/search")
     def search(user: User, q: str = Query(min_length=1, max_length=120)):

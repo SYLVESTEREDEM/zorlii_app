@@ -57,7 +57,7 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("/api/notifications/read", html)
         self.assertIn("/followers?limit=1", html)
         self.assertIn("/following?limit=1", html)
-        self.assertIn("renderSocialList(kind)", html)
+        self.assertIn("renderSocialList(kind,username=me.username)", html)
         self.assertIn('data-go="social-followers"', html)
         self.assertIn('data-go="social-following"', html)
         self.assertIn("4–128 characters", mobile)
@@ -238,10 +238,7 @@ class WebUiRegressionTests(unittest.TestCase):
     def test_web_mentions_are_escaped_linked_and_use_registered_username_boundaries(self):
         html = (ROOT / "index.html").read_text(encoding="utf-8")
 
-        self.assertIn(
-            r"/(?<![A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])/gi",
-            html,
-        )
+        self.assertIn(r"(?<![A-Za-z0-9_@.])@([A-Za-z0-9_]{3,24})(?![A-Za-z0-9_])", html)
         self.assertIn("function mentionMarkup(text)", html)
         self.assertIn("profileLinkMarkup(match[1]", html)
         self.assertIn("function profileLinkMarkup(username,label", html)
@@ -249,6 +246,45 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("${mentionMarkup(p.body)}", html)
         self.assertIn("${mentionMarkup(r.body)}", html)
         self.assertIn("'mention-link'", html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise the web JavaScript")
+    def test_hashtag_links_escape_text_and_preserve_mentions(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        lines = html.splitlines()
+        code = "\n".join(next(line for line in lines if marker in line) for marker in (
+            "const esc=s=>", "function profileLinkMarkup(", "function mentionMarkup(",
+        ))
+        script = code + """
+        const assert = require('node:assert/strict');
+        const result = mentionMarkup('<b> @alice #Music! #Café #musical foo#music ##music');
+        assert.match(result, /&lt;b&gt;/);
+        assert.match(result, /data-profile="alice"/);
+        assert.match(result, /data-hashtag="Music"/);
+        assert.match(result, /data-hashtag="Café"/);
+        assert.equal((result.match(/data-hashtag=/g) || []).length, 3);
+        """
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+
+    def test_follower_links_open_the_selected_members_list(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn('data-action="member-list" data-kind="followers" data-user="${esc(u.username)}"', html)
+        self.assertIn('data-action="member-list" data-kind="following" data-user="${esc(u.username)}"', html)
+        self.assertIn('openSocialList(publicProfile.username, "followers")', mobile)
+        self.assertIn('openSocialList(publicProfile.username, "following")', mobile)
+        self.assertIn("people.length < socialList.count", mobile)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise the mobile tag pattern")
+    def test_mobile_tag_pattern_keeps_mentions_and_hashtag_boundaries(self):
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        pattern = next(line for line in mobile.splitlines() if "const mentionPattern =" in line)
+        script = pattern + """
+        const assert = require('node:assert/strict');
+        const tokens = [...'@alice #Music! #Café foo#music ##music'.matchAll(mentionPattern)]
+          .map(match => match[2] ? '@' + match[2] : '#' + match[4]);
+        assert.deepEqual(tokens, ['@alice', '#Music', '#Café']);
+        """
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
 
     def test_web_conversation_history_paginates_without_losing_loaded_messages(self):
         html = (ROOT / "index.html").read_text(encoding="utf-8")
