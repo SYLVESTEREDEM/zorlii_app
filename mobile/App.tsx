@@ -1633,7 +1633,7 @@ function AppContent() {
     return <View>
       <Text style={styles.eyebrow}>Your community, in focus</Text><Text style={styles.title}>Pulse</Text>
       <View style={styles.row}>{button("Everyone", () => loadFeed("all"), true)}{button("Following", () => loadFeed("following"), true)}{button("Saved", () => loadFeed("bookmarks"), true)}</View>
-      <TextInput ref={composerRef} accessibilityLabel="Write a post" placeholder="What would you like to share?" multiline maxLength={5000} value={form.post || ""} onChangeText={value => update("post", value)} style={[styles.input, styles.multiline]} />
+      <TextInput ref={composerRef} accessibilityLabel="Write a post" placeholder="What would you like to share?" placeholderTextColor="#8987a5" multiline maxLength={5000} value={form.post || ""} onChangeText={value => update("post", value)} style={[styles.input, styles.multiline]} />
       {quoteTarget ? <View style={styles.quotePreview}>
         <Text style={styles.quotedLabel}>Echo with a thought · original {quoteTarget.type}</Text>
         <View style={styles.postAuthor}><Avatar user={quoteTarget.item.author} size={30} onPress={profilePhotoAction(quoteTarget.item.author)} /><View>

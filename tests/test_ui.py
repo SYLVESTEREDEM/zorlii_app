@@ -144,6 +144,8 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("document.getElementById('post-body')?.focus()", html)
         self.assertIn('["feed", "explore", "create", "inbox", "notifications", "profile"]', mobile)
         self.assertIn("composerRef.current?.focus()", mobile)
+        composer = mobile.split('<TextInput ref={composerRef}', 1)[1].split("/>", 1)[0]
+        self.assertIn('placeholderTextColor="#8987a5"', composer)
         self.assertIn("Privacy &amp; local tools", html)
         self.assertIn("Privacy & local tools", mobile)
 
