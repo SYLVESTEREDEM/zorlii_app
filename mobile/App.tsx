@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator, Alert, AppState, Image, KeyboardAvoidingView, Linking, Modal, Platform, Pressable,
-  ScrollView, Share, StyleSheet, Text, TextInput, View,
+  AccessibilityInfo, ActivityIndicator, Alert, Animated, AppState, Easing, Image, KeyboardAvoidingView,
+  Linking, Modal, Platform, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import * as SecureStore from "expo-secure-store";
 import * as ImagePicker from "expo-image-picker";
@@ -22,7 +22,7 @@ Notifications.setNotificationHandler({
   }),
 });
 type ActivityCounts = { posts: number; media: number; replies: number; likes: number; echoes: number; saved: number; messages: number };
-type User = { id: number; username: string; email: string; display_name: string; bio: string; avatar_url: string | null; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean; terms_accepted: boolean; is_moderator: boolean; activity_counts?: ActivityCounts };
+type User = { id: number; username: string; email: string; display_name: string; bio: string; avatar_url: string | null; interests: string[]; recommendations_consent: boolean; context_assistance_consent: boolean; terms_accepted: boolean; is_moderator: boolean; theme_color?: string; joined_at?: string | null; created_at?: string | null; activity_counts?: ActivityCounts };
 type ReportTarget = { target_type: "post" | "user"; target_id: number; label: string };
 type ModerationReport = { id: number; target_type: "post" | "user"; post_id: number | null; target_user_id: number | null; target_username: string | null; reporter_username: string; reason: string; details: string; status: string; created_at: string; post_body: string | null };
 type PostMedia = { id: number; url: string; media_type: string };
@@ -31,12 +31,35 @@ type Reply = { id: number; body: string; created_at?: string; reaction_count: nu
 type Post = { id: number; body: string; created_at: string; reaction_count: number; repost_count: number; reply_count: number; reacted: boolean; reposted: boolean; bookmarked: boolean; reposted_by?: Author | null; quoted_post?: Post | null; quoted_reply?: Reply | null; media?: PostMedia[]; author: Author };
 type Conversation = { id: number; created_at?: string; last_message?: string; participants: { id: number; username: string; display_name: string; avatar_url?: string | null }[] };
 type DirectMessage = { id: number; body: string; created_at: string; sender_id: number; author: Author };
-type PublicProfile = Author & { bio: string; following: boolean; follower_count: number; following_count: number };
+type PublicProfile = Author & { bio: string; following: boolean; follower_count: number; following_count: number; joined_at?: string | null; created_at?: string | null };
 type Member = { id: number; username: string; display_name: string; bio: string; avatar_url?: string | null };
 type NotificationItem = { id: number; kind: "follow" | "reply" | "reaction" | "repost" | "quote" | "message" | "reply_reaction" | "reply_repost" | "mention"; post_id: number | null; reply_id?: number | null; created_at: string; read: boolean; actor: Author };
 type QuoteTarget = { type: "post" | "reply"; item: Post | Reply };
 type NativeFilePart = { uri: string; name: string; type: string };
 type NativeUploadFormData = FormData & { append(name: string, value: string | NativeFilePart): void };
+const DEFAULT_ACCENT = "#a47dff";
+let activeThemeAccent = DEFAULT_ACCENT;
+let activeReduceMotion = true;
+function validHexColor(value?: string | null): value is string { return typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value); }
+function colorLuminance(color: string) {
+  const [red, green, blue] = color.slice(1).match(/.{2}/g)!.map(part => parseInt(part, 16) / 255)
+    .map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+}
+function contrastForeground(color: string) { return colorLuminance(color) > 0.179 ? "#11111b" : "#ffffff"; }
+function readableAccent(color: string) { return (colorLuminance(color) + 0.05) / 0.067 > 4.5 ? color : "#ffffff"; }
+function formatJoinedDate(value?: string | null) {
+  if (!value) return "";
+  const text = value.trim();
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T00:00:00Z`
+    : text.includes("T") ? text : text.includes(" ") ? text.replace(" ", "T") : `${text}T00:00:00Z`;
+  const date = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+  if (Number.isNaN(date.getTime())) return "";
+  const day = date.getUTCDate();
+  const suffix = day % 100 >= 11 && day % 100 <= 13 ? "th" : ({ 1: "st", 2: "nd", 3: "rd" } as Record<number, string>)[day % 10] || "th";
+  const month = new Intl.DateTimeFormat("en", { month: "long", timeZone: "UTC" }).format(date);
+  return `Joined ${day}${suffix} ${month}, ${date.getUTCFullYear()}`;
+}
 
 function PostVideo({ uri, token, style = styles.postVideo }: { uri: string; token: string; style?: any }) {
   const player = useVideoPlayer(
@@ -49,8 +72,9 @@ function PostVideo({ uri, token, style = styles.postVideo }: { uri: string; toke
 function MediaPickerButton({ label, onPress }: { label: string; onPress: () => void }) {
   return <Pressable accessibilityRole="button" accessibilityLabel={label}
     accessibilityHint="Choose photos, videos, or GIFs to attach."
-    onPress={onPress} style={({ pressed }) => [styles.mediaPickerButton, pressed && styles.buttonPressed]}>
-    <Text style={styles.mediaPickerIcon} accessibilityElementsHidden>+</Text>
+    onPress={onPress} style={({ pressed }) => [styles.mediaPickerButton, { borderColor: readableAccent(activeThemeAccent) },
+      pressed && (activeReduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+    <Text style={[styles.mediaPickerIcon, { color: readableAccent(activeThemeAccent) }]} accessibilityElementsHidden>+</Text>
   </Pressable>;
 }
 
@@ -108,7 +132,7 @@ function formatConversationDate(value: string) {
 function BrandHalo({ size = 48, showLogo = false, quiet = false }: { size?: number; showLogo?: boolean; quiet?: boolean }) {
   return <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants"
     style={[styles.brandHaloWrap, quiet && styles.quietBrandHaloWrap, { width: size + 14, height: size + 14, borderRadius: (size + 14) / 2 }]}>
-    <View style={[styles.brandHaloRing, quiet && styles.quietBrandHaloRing, { width: size + 8, height: size + 8, borderRadius: (size + 8) / 2 }]}>
+    <View style={[styles.brandHaloRing, quiet && styles.quietBrandHaloRing, { width: size + 8, height: size + 8, borderRadius: (size + 8) / 2, borderColor: readableAccent(activeThemeAccent) }]}>
       <View style={[styles.brandCore, quiet && styles.quietBrandCore, { width: size, height: size, borderRadius: size / 2 }]}>
         {showLogo
           ? <Image source={require("./assets/zorlii-logo.png")} style={[styles.logo, { width: size, height: size, borderRadius: size / 2 }]} resizeMode="contain" />
@@ -130,7 +154,7 @@ function Avatar({ user, size = 42, onPress }: {
   useEffect(() => { setImageFailed(false); }, [user?.avatar_url]);
   const contents = <View accessible={!onPress} accessibilityRole={onPress ? undefined : "image"}
     accessibilityLabel={user?.avatar_url && !imageFailed ? `${name} profile photo` : `${initials} initials`}
-    style={[styles.avatarHalo, { width: size + 10, height: size + 10, borderRadius: (size + 10) / 2 }]}>
+    style={[styles.avatarHalo, { width: size + 10, height: size + 10, borderRadius: (size + 10) / 2, borderColor: readableAccent(activeThemeAccent) }]}>
     <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2 }]}>
       {user?.avatar_url && !imageFailed
         ? <Image source={{ uri: `${API_URL}${user.avatar_url}` }} style={styles.avatarImage} onError={() => setImageFailed(true)} />
@@ -161,6 +185,11 @@ function AppContent() {
   const publicProfileLoadedOlderRef = useRef(false);
   const [token, setToken] = useState("");
   const [me, setMe] = useState<User | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [reduceMotion, setReduceMotion] = useState(true);
+  const screenOpacity = useRef(new Animated.Value(1)).current;
+  const screenOffset = useRef(new Animated.Value(0)).current;
+  const [themeColorDraft, setThemeColorDraft] = useState(DEFAULT_ACCENT);
   const [screen, setScreen] = useState("login");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -206,6 +235,40 @@ function AppContent() {
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(null);
   const [moderationReports, setModerationReports] = useState<ModerationReport[]>([]);
   const reportReturnScreen = useRef("feed");
+  function updateMe(user: Partial<User> | null) {
+    if (!user) { setMe(null); setThemeColorDraft(DEFAULT_ACCENT); activeThemeAccent = DEFAULT_ACCENT; return; }
+    setMe(current => current ? { ...current, ...user } as User : user as User);
+    if (validHexColor(user.theme_color)) {
+      activeThemeAccent = user.theme_color.toLowerCase();
+      setThemeColorDraft(activeThemeAccent);
+    }
+  }
+  useEffect(() => {
+    let active = true;
+    void AccessibilityInfo.isReduceMotionEnabled().then(enabled => {
+      if (active) setReduceMotion(enabled);
+    }).catch(() => { if (active) setReduceMotion(false); });
+    const subscription = AccessibilityInfo.addEventListener("reduceMotionChanged", setReduceMotion);
+    return () => { active = false; subscription.remove(); };
+  }, []);
+  useEffect(() => {
+    screenOpacity.stopAnimation();
+    screenOffset.stopAnimation();
+    if (reduceMotion) {
+      screenOpacity.setValue(1);
+      screenOffset.setValue(0);
+      return;
+    }
+    screenOpacity.setValue(0.96);
+    screenOffset.setValue(4);
+    const transition = Animated.parallel([
+      Animated.timing(screenOpacity, { toValue: 1, duration: 150, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+      Animated.timing(screenOffset, { toValue: 0, duration: 150, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+    ]);
+    transition.start();
+    return () => transition.stop();
+  }, [screen, reduceMotion, screenOpacity, screenOffset]);
+  activeReduceMotion = reduceMotion;
 
   async function request(path: string, method = "GET", body?: unknown) {
     const response = await fetch(`${API_URL}${path}`, {
@@ -298,7 +361,7 @@ function AppContent() {
       if (mentionStart > cursor) parts.push(body.slice(cursor, mentionStart));
       const username = match[2];
       parts.push(<Text key={`${mentionStart}-${username}`} accessibilityRole="link"
-        accessibilityLabel={`View @${username}'s profile`} style={styles.mention}
+        accessibilityLabel={`View @${username}'s profile`} style={[styles.mention, { color: readableAccent(activeThemeAccent) }]}
         onPress={() => { void openPublicProfile(username); }}>@{username}</Text>);
       cursor = mentionPattern.lastIndex;
     }
@@ -358,7 +421,7 @@ function AppContent() {
       if (!profileLoadedOlderRef.current) {
         setProfileHasMore(Boolean(postData.has_more));
       }
-      setMe(meData.user);
+      updateMe(meData.user);
       setActivityCounts(meData.user.activity_counts || null);
       setFollowers(followerData.users);
       setFollowing(followingData.users);
@@ -366,6 +429,11 @@ function AppContent() {
       setFollowerCount(followerData.count);
       setFollowingCount(followingData.count);
     }
+    catch (e) { fail(e); }
+  }
+  async function loadSettings() {
+    setScreen("settings");
+    try { setBlockedUsers((await request("/api/blocks")).users); }
     catch (e) { fail(e); }
   }
   async function saveProfileSection(section: "profile" | "privacy") {
@@ -379,8 +447,17 @@ function AppContent() {
     };
     try {
       const result = await request("/api/profile", "PATCH", body);
-      setMe(result.user);
+      updateMe(result.user);
       Alert.alert("Saved", section === "profile" ? "Your profile has been updated." : "Your privacy choices have been updated.");
+    } catch (e) { fail(e); }
+  }
+  async function saveThemeColor() {
+    const color = themeColorDraft.trim();
+    if (!validHexColor(color)) { setError("Enter a six-digit hex colour such as #A47DFF."); return; }
+    try {
+      const result = await request("/api/settings/theme", "PATCH", { theme_color: color.toLowerCase() });
+      updateMe(result.user);
+      Alert.alert("Appearance saved", "Your accent colour is now applied to your account.");
     } catch (e) { fail(e); }
   }
   async function pickAvatar() {
@@ -403,7 +480,7 @@ function AppContent() {
         type: contentType,
       });
       await uploadRequest("/api/profile/avatar", body, "PUT");
-      setMe((await request("/api/me")).user);
+      updateMe((await request("/api/me")).user);
       Alert.alert("Photo updated", "Your profile photo is ready.");
     } catch (e) { fail(e); }
   }
@@ -429,7 +506,7 @@ function AppContent() {
       { text: "Remove photo", style: "destructive", onPress: async () => {
         try {
           await request("/api/profile/avatar", "DELETE");
-          setMe((await request("/api/me")).user);
+          updateMe((await request("/api/me")).user);
         } catch (e) { fail(e); }
       } },
     ]);
@@ -588,7 +665,7 @@ function AppContent() {
   async function acceptTerms() {
     try {
       const result = await request("/api/terms/accept", "POST", { accepted: true });
-      setMe(result.user);
+      updateMe(result.user);
       setScreen("feed");
       await loadFeed();
     } catch (e) { fail(e); }
@@ -677,7 +754,7 @@ function AppContent() {
       if (!response.ok) throw new Error("Please sign in again.");
       const data = await response.json();
       profileUserRef.current = data.user.id;
-      setMe(data.user);
+      updateMe(data.user);
       setActivityCounts(data.user.activity_counts || null);
       if (!data.user.terms_accepted) {
         setScreen("terms");
@@ -815,7 +892,7 @@ function AppContent() {
     catch (e) { fail(e); }
     await SecureStore.deleteItemAsync("zorlii_session");
     resetConversationState();
-    setToken(""); setMe(null); setScreen("login"); setForm({}); setPostMedia([]);
+    setToken(""); updateMe(null); setScreen("login"); setForm({}); setPostMedia([]);
   }
   async function exportAccount() {
     try {
@@ -842,7 +919,7 @@ function AppContent() {
             await request("/api/account", "DELETE", { password: form.delete_password || "" });
             await SecureStore.deleteItemAsync("zorlii_session");
             resetConversationState();
-            setToken(""); setMe(null); setForm({}); setPostMedia([]); setScreen("login");
+            setToken(""); updateMe(null); setForm({}); setPostMedia([]); setScreen("login");
             setError("Your account and account-owned content have been deleted.");
           } catch (e) { fail(e); }
           finally { setLoading(false); }
@@ -975,11 +1052,20 @@ function AppContent() {
       autoCapitalize="none" style={[styles.input, multiline && styles.multiline]} />
     );
   };
+  const themeColor = validHexColor(me?.theme_color) ? me.theme_color : DEFAULT_ACCENT;
+  const safeAccent = readableAccent(themeColor);
+  const themeText = contrastForeground(safeAccent);
+  activeThemeAccent = themeColor;
   const button = (label: string, action: () => void, secondary = false) => (
-    <Pressable accessibilityRole="button" onPress={action} style={({ pressed }) => [styles.button, secondary && styles.secondary, pressed && styles.buttonPressed]}>
-      <Text style={[styles.buttonText, secondary && styles.secondaryText]}>{label}</Text>
+    <Pressable accessibilityRole="button" onPress={action} style={({ pressed }) => [styles.button, secondary && styles.secondary,
+      secondary ? { borderColor: safeAccent } : { backgroundColor: safeAccent, borderColor: safeAccent, shadowColor: safeAccent },       pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+      <Text style={[styles.buttonText, secondary ? { color: safeAccent } : { color: themeText }]}>{label}</Text>
     </Pressable>
   );
+  const menuButton = (label: string, action: () => void) => <Pressable accessibilityRole="button"
+    onPress={() => { setMenuOpen(false); action(); }} style={({ pressed }) => [styles.menuItem, pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+    <Text style={styles.menuItemText}>{label}</Text>
+  </Pressable>;
   const disclosure = (key: string, label: string, content: React.ReactNode) => {
     const expanded = Boolean(profileSections[key]);
     return <View style={styles.disclosure}>
@@ -998,15 +1084,15 @@ function AppContent() {
       accessibilityHint="Choose Echo or Echo with a thought."
       accessibilityState={{ selected: item.reposted }}
       onPress={() => showEchoOptions(item, type)}
-      style={({ pressed }) => [styles.button, styles.secondary, item.reposted && styles.echoSelected, pressed && styles.buttonPressed]}>
-      <Text style={[styles.buttonText, styles.secondaryText, item.reposted && styles.echoSelectedText]}>
+      style={({ pressed }) => [styles.button, styles.secondary, { borderColor: safeAccent }, item.reposted && [styles.echoSelected, { backgroundColor: safeAccent, borderColor: safeAccent }], pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+      <Text style={[styles.buttonText, styles.secondaryText, { color: safeAccent }, item.reposted && { color: themeText }]}>
         ↗ Echo{item.repost_count ? ` · ${item.repost_count}` : ""}
       </Text>
     </Pressable>
   );
   const profileLink = (username: string, label: string, textStyle: any = styles.author) => (
     <Text accessibilityRole="link" accessibilityLabel={`View @${username}'s profile`}
-      onPress={() => { void openPublicProfile(username); }} style={[textStyle, styles.profileLink]}>{label}</Text>
+      onPress={() => { void openPublicProfile(username); }} style={[textStyle, styles.profileLink, { color: readableAccent(activeThemeAccent) }]}>{label}</Text>
   );
   const profilePhotoAction = (user?: { display_name?: string; username?: string; avatar_url?: string | null } | null) =>
     user?.avatar_url ? () => showImage(`${API_URL}${user.avatar_url}`, `${user.display_name || user.username || "Member"} profile photo`) : undefined;
@@ -1038,9 +1124,10 @@ function AppContent() {
           if (item === "notifications") { setScreen("notifications"); loadNotifications(); }
           if (item === "profile") loadProfile();
         }}>
-        <Text style={[styles.tabIcon, selected && styles.activeTabIcon, item === "create" && styles.createIcon]}
-          accessibilityElementsHidden>{navIcons[item]}{item === "notifications" && unreadNotifications > 0 ? <Text style={styles.tabBadge}>{unreadNotifications}</Text> : null}</Text>
-        <Text style={[styles.tab, selected && styles.activeTab]}>{navLabels[item]}</Text>
+        <Text style={[styles.tabIcon, selected && styles.activeTabIcon, selected && { color: safeAccent }, item === "create" && styles.createIcon,
+          item === "create" && { backgroundColor: safeAccent, color: themeText }]}
+          accessibilityElementsHidden>{navIcons[item]}{item === "notifications" && unreadNotifications > 0 ? <Text style={[styles.tabBadge, { backgroundColor: safeAccent, color: themeText }]}>{unreadNotifications}</Text> : null}</Text>
+        <Text style={[styles.tab, selected && styles.activeTab, selected && { color: safeAccent }]}>{navLabels[item]}</Text>
       </Pressable>;
     })}
   </View>;
@@ -1208,7 +1295,7 @@ function AppContent() {
           });
           await SecureStore.deleteItemAsync("zorlii_session");
           resetConversationState();
-          setToken(""); setMe(null); setScreen("login");
+          setToken(""); updateMe(null); setScreen("login");
           setError("Password updated. Sign in with your new password.");
         } catch (e) { fail(e); }
       })}
@@ -1235,7 +1322,7 @@ function AppContent() {
         {button("Refresh", loadNotifications, true)}
         {unreadNotifications ? button("Mark all as read", markAllNotificationsRead, true) : null}
       </View>
-      {loading ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} /> : null}
+      {loading ? <ActivityIndicator color={safeAccent} style={{ margin: 20 }} /> : null}
       {notifications.map(item => <View key={item.id} style={[styles.post, !item.read && styles.unreadNotification]}>
         <View style={styles.postAuthor}><Avatar user={item.actor} size={38} onPress={profilePhotoAction(item.actor)} /><View>
           {profileLink(item.actor.username, item.actor.display_name)}
@@ -1260,6 +1347,7 @@ function AppContent() {
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={styles.title}>{publicProfile.display_name}</Text>
             {profileLink(publicProfile.username, `@${publicProfile.username}`, styles.handle)}
+            {formatJoinedDate(publicProfile.joined_at || publicProfile.created_at) ? <Text style={[styles.handle, { marginTop: 4 }]}>{formatJoinedDate(publicProfile.joined_at || publicProfile.created_at)}</Text> : null}
           </View>
         </View>
         <Text style={styles.section}>A little about you</Text>
@@ -1279,8 +1367,8 @@ function AppContent() {
         {publicProfileHasMore ? <Pressable accessibilityRole="button"
           accessibilityState={{ disabled: loadingPublicProfileOlder }}
           disabled={loadingPublicProfileOlder} onPress={() => { void loadOlderProfilePosts(true); }}
-          style={({ pressed }) => [styles.button, styles.secondary, pressed && styles.buttonPressed]}>
-          <Text style={[styles.buttonText, styles.secondaryText]}>{loadingPublicProfileOlder ? "Loading older posts…" : "Load older posts"}</Text>
+          style={({ pressed }) => [styles.button, styles.secondary, { borderColor: safeAccent }, pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+          <Text style={[styles.buttonText, styles.secondaryText, { color: safeAccent }]}>{loadingPublicProfileOlder ? "Loading older posts…" : "Load older posts"}</Text>
         </Pressable> : null}
       </> : !loading ? <Text style={styles.copy}>This profile could not be loaded.</Text> : null}
     </View>;
@@ -1380,7 +1468,7 @@ function AppContent() {
               {loadingOlderMessages ? <ActivityIndicator color="#cdb6ff" /> : <Text style={styles.loadOlderText}>↑  Load older messages</Text>}
             </Pressable> : null}
             {loadingMessages && !messages.length
-              ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} />
+              ? <ActivityIndicator color={safeAccent} style={{ margin: 20 }} />
               : !messages.length ? <Text style={styles.copy}>No messages yet. Send a note to begin.</Text> : messages.map(message =>
               <View key={message.id} onLayout={event => onMessageLayout(message.id, event.nativeEvent.layout.y)}
                 style={[styles.message, message.sender_id === me?.id && styles.myMessage]}>
@@ -1409,13 +1497,14 @@ function AppContent() {
           <Avatar user={me} size={88} onPress={profilePhotoAction(me)} />
           <Pressable accessibilityRole="button" accessibilityLabel="Upload profile photo"
             accessibilityHint="Choose a new photo for your profile."
-            onPress={pickAvatar} style={({ pressed }) => [styles.avatarUploadButton, pressed && styles.buttonPressed]}>
-            <Text style={styles.avatarUploadText} accessibilityElementsHidden>+</Text>
+            onPress={pickAvatar} style={({ pressed }) => [styles.avatarUploadButton, { backgroundColor: safeAccent }, pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+            <Text style={[styles.avatarUploadText, { color: themeText }]} accessibilityElementsHidden>+</Text>
           </Pressable>
         </View>
         <View style={{ flex: 1, minWidth: 0 }}>
           {me?.username ? profileLink(me.username, me.display_name || "Your profile", styles.title) : <Text style={styles.title}>Your profile</Text>}
           {me?.username ? profileLink(me.username, `@${me.username}`, styles.handle) : null}
+          {formatJoinedDate(me?.joined_at || me?.created_at) ? <Text style={[styles.handle, { marginTop: 4 }]}>{formatJoinedDate(me?.joined_at || me?.created_at)}</Text> : null}
         </View>
       </View>
       <Text style={styles.section}>A little about you</Text>
@@ -1425,28 +1514,37 @@ function AppContent() {
         <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-followers")}><Text style={styles.countValue}>{followerCount}</Text><Text style={styles.countLabel}>Followers</Text></Pressable>
         <Pressable accessibilityRole="button" style={styles.countCard} onPress={() => setScreen("social-following")}><Text style={styles.countValue}>{followingCount}</Text><Text style={styles.countLabel}>Following</Text></Pressable>
       </View>
-      <View style={styles.row}>
-        {(["media", "replies", "likes", "echoes"] as const).map(key => <View key={key} style={styles.countCard}>
+      <View style={styles.activityGrid}>
+        {(["media", "replies", "likes", "echoes", "saved", "messages"] as const).map(key => <View key={key} style={[styles.countCard, styles.activityMetric]}>
           <Text style={styles.countValue}>{activityCounts?.[key] ?? "—"}</Text>
-          <Text style={styles.countLabel}>{key[0].toUpperCase() + key.slice(1)}</Text>
-        </View>)}
-      </View>
-      <View style={styles.row}>
-        {(["saved", "messages"] as const).map(key => <View key={key} style={styles.countCard}>
-          <Text style={styles.countValue}>{activityCounts?.[key] ?? "—"}</Text>
-          <Text style={styles.countLabel}>{key === "messages" ? "Messages sent" : "Saved"}</Text>
+          <Text style={styles.countLabel}>{key === "messages" ? "Messages sent" : key[0].toUpperCase() + key.slice(1)}</Text>
         </View>)}
       </View>
       <Text style={styles.section}>Your posts</Text>
       {profilePosts.map(post => postCard(post))}
       {!profilePosts.length ? <Text style={styles.copy}>Your posts will appear here when you share them.</Text> : null}
-      {profileHasMore ? <Pressable accessibilityRole="button"
-        accessibilityState={{ disabled: loadingProfileOlder }}
+      {profileHasMore ? <Pressable accessibilityRole="button" accessibilityState={{ disabled: loadingProfileOlder }}
         disabled={loadingProfileOlder} onPress={() => { void loadOlderProfilePosts(false); }}
-        style={({ pressed }) => [styles.button, styles.secondary, pressed && styles.buttonPressed]}>
-        <Text style={[styles.buttonText, styles.secondaryText]}>{loadingProfileOlder ? "Loading older posts…" : "Load older posts"}</Text>
+        style={({ pressed }) => [styles.button, styles.secondary, { borderColor: safeAccent }, pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+        <Text style={[styles.buttonText, styles.secondaryText, { color: safeAccent }]}>{loadingProfileOlder ? "Loading older posts…" : "Load older posts"}</Text>
       </Pressable> : null}
-      <Text style={styles.section}>Profile tools</Text>
+    </View>;
+    if (screen === "settings") return <View>
+      <Text style={styles.eyebrow}>Your account</Text>
+      <Text style={styles.title}>Settings</Text>
+      <Text style={styles.copy}>Your appearance, profile, privacy and account controls.</Text>
+      <View style={styles.settingsPanel}>
+        <Text style={styles.section}>Appearance</Text>
+        <Text style={styles.copy}>Choose any six-digit hex accent. Text contrast adjusts automatically, while surfaces remain readable.</Text>
+        <View style={styles.row}>
+          <View style={[styles.colorSwatch, { backgroundColor: validHexColor(themeColorDraft) ? themeColorDraft : themeColor }]} accessibilityElementsHidden />
+          <TextInput accessibilityLabel="Accent colour hex value" accessibilityHint="Enter a six-digit hex colour, for example #A47DFF."
+            value={themeColorDraft} onChangeText={value => setThemeColorDraft(value)} autoCapitalize="characters"
+            maxLength={7} placeholder="#A47DFF" placeholderTextColor="#8987a5" style={styles.input} />
+        </View>
+        {button("Save appearance", saveThemeColor)}
+      </View>
+      <Text style={styles.section}>Profile and privacy</Text>
       {disclosure("edit-profile", "Edit profile", <>
         {field("display_name", "Display name")}
         {field("bio", "A little about you", false, true)}
@@ -1503,10 +1601,8 @@ function AppContent() {
         {button("Enable activity alerts", async () => {
           try {
             const enabled = await registerPushToken(token);
-            Alert.alert(
-              enabled ? "Activity alerts enabled" : "Notifications are off",
-              enabled ? "This device is ready to receive Zorlii activity alerts." : "Allow notifications in your device settings, then try again.",
-            );
+            Alert.alert(enabled ? "Activity alerts enabled" : "Notifications are off",
+              enabled ? "This device is ready to receive Zorlii activity alerts." : "Allow notifications in your device settings, then try again.");
           } catch (e) { fail(e); }
         }, true)}
         <Text style={styles.section}>Your data</Text>
@@ -1548,7 +1644,7 @@ function AppContent() {
         {mediaContent(quoteTarget.item.media)}
         {button("Remove original", () => setQuoteTarget(null), true)}
       </View> : null}
-      <View style={styles.row}><Text style={styles.copy}>Visible to: </Text><Pressable onPress={() => update("visibility", form.visibility === "public" ? "followers" : form.visibility === "followers" ? "private" : "public")}><Text style={styles.link}>{form.visibility || "public"} ⌄</Text></Pressable></View>
+      <View style={styles.row}><Text style={styles.copy}>Visible to: </Text><Pressable onPress={() => update("visibility", form.visibility === "public" ? "followers" : form.visibility === "followers" ? "private" : "public")}><Text style={[styles.link, { color: readableAccent(activeThemeAccent) }]}>{form.visibility || "public"} ⌄</Text></Pressable></View>
       <View style={styles.row}><MediaPickerButton label="Attach photos, videos, or GIFs to post" onPress={pickPostMedia} />{postMedia.length ? button("Clear media", () => setPostMedia([]), true) : null}</View>
       {postMedia.length ? <ScrollView horizontal style={styles.mediaSelection} contentContainerStyle={styles.mediaSelectionContent}>
         {postMedia.map((asset, index) => <View key={`${asset.assetId || asset.uri}-${index}`} style={styles.mediaSelectionItem}>
@@ -1557,24 +1653,59 @@ function AppContent() {
         </View>)}
       </ScrollView> : null}
       {button("Share thought", sharePost)}
-      {loading ? <ActivityIndicator color="#a47dff" style={{ margin: 20 }} /> : posts.map(post => postCard(post))}
+      {loading ? <ActivityIndicator color={safeAccent} style={{ margin: 20 }} /> : posts.map(post => postCard(post))}
       {!loading && posts.length === 0 ? <View style={styles.empty}><BrandHalo size={58} quiet /><Text style={styles.section}>Nothing here just yet.</Text><Text style={styles.copy}>Conversations shared by real Zorlii members will appear here.</Text></View> : null}
     </View>;
   }
 
   return <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={0}>
     <StatusBar style="light" />
-    <View style={[styles.header, { paddingTop: 10 + insets.top }]}><BrandHalo size={42} showLogo /><View style={styles.headerCopy}><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub} numberOfLines={1}>A thoughtful little corner</Text></View>
+    <View style={[styles.header, { paddingTop: 10 + insets.top, borderBottomColor: `${safeAccent}55` }]}>
+      {me?.terms_accepted ? <Pressable accessibilityRole="button" accessibilityLabel="Open menu" accessibilityHint="Open profile tools, settings and account navigation."
+        accessibilityState={{ expanded: menuOpen }} onPress={() => setMenuOpen(true)}
+        style={({ pressed }) => [styles.menuToggle, { borderColor: `${safeAccent}88` }, pressed && (reduceMotion ? styles.buttonPressedReduced : styles.buttonPressed)]}>
+        <Text style={[styles.menuToggleText, { color: safeAccent }]} accessibilityElementsHidden>☰</Text>
+      </Pressable> : null}
+      <BrandHalo size={42} showLogo /><View style={styles.headerCopy}><Text style={styles.brand}>Zorlii</Text><Text style={styles.headerSub} numberOfLines={1}>A thoughtful little corner</Text></View>
       {me ? <View style={styles.userTag}><Avatar user={me} size={24} onPress={profilePhotoAction(me)} /><Text accessibilityRole="link"
         onPress={() => loadProfile()} style={styles.userTagText} numberOfLines={1}>@{me.username}</Text></View> : null}</View>
     <ScrollView style={styles.scroll} keyboardShouldPersistTaps="handled" keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
       automaticallyAdjustKeyboardInsets={Platform.OS === "ios"} contentContainerStyle={styles.content}>
       {error ? <Pressable onPress={() => setError("")} style={styles.error}><Text style={styles.errorText}>{error}  ×</Text></Pressable> : null}
-      {loading && screen !== "feed" ? <ActivityIndicator color="#a47dff" /> : null}
-      {renderBody()}
+      {loading && screen !== "feed" ? <ActivityIndicator color={safeAccent} /> : null}
+      <Animated.View style={{ opacity: screenOpacity, transform: [{ translateY: screenOffset }] }}>
+        {renderBody()}
+      </Animated.View>
     </ScrollView>
     {me?.terms_accepted ? <View style={{ paddingBottom: insets.bottom, backgroundColor: "#0b1020" }}>{nav()}</View> : null}
-    <Modal visible={Boolean(selectedImage)} transparent animationType="fade" onRequestClose={() => setSelectedImage(null)}>
+    <Modal visible={menuOpen} transparent animationType={reduceMotion ? "none" : "fade"} onRequestClose={() => setMenuOpen(false)}>
+      <View style={styles.menuModalRoot} accessibilityViewIsModal>
+        <Pressable style={StyleSheet.absoluteFill} accessibilityRole="button" accessibilityLabel="Close menu"
+          onPress={() => setMenuOpen(false)} />
+        <View style={[styles.menuDrawer, { paddingTop: insets.top + 16, paddingBottom: insets.bottom + 18 }]}>
+          <View style={styles.menuHeading}><Text style={styles.menuTitle}>Your Zorlii</Text>
+            <Pressable accessibilityRole="button" accessibilityLabel="Close menu" onPress={() => setMenuOpen(false)} style={styles.menuClose}>
+              <Text style={styles.menuCloseText}>×</Text>
+            </Pressable>
+          </View>
+          {me ? <View style={styles.menuAccount}><Avatar user={me} size={38} /><View style={{ flex: 1 }}>
+            <Text style={styles.menuAccountName}>{me.display_name}</Text><Text style={styles.handle}>@{me.username}</Text>
+          </View></View> : null}
+          <ScrollView keyboardShouldPersistTaps="handled">
+            {menuButton("Pulse", () => { setScreen("feed"); void loadFeed(); })}
+            {menuButton("Explore", () => setScreen("explore"))}
+            {menuButton("Inbox", () => { void loadInbox(); })}
+            {menuButton(`Activities${unreadNotifications ? ` · ${unreadNotifications} unread` : ""}`, () => { setScreen("notifications"); void loadNotifications(); })}
+            {menuButton("Your profile", () => { void loadProfile(); })}
+            {menuButton("Settings & profile tools", () => { void loadSettings(); })}
+            {me?.is_moderator ? menuButton("Moderator reports", () => { setScreen("moderation"); void loadModerationReports(); }) : null}
+            {menuButton(`Blocked accounts · ${blockedUsers.length}`, async () => { try { setBlockedUsers((await request("/api/blocks")).users); setScreen("blocked"); } catch (e) { fail(e); } })}
+            {menuButton("Sign out", () => { void logout(); })}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+    <Modal visible={Boolean(selectedImage)} transparent animationType={reduceMotion ? "none" : "fade"} onRequestClose={() => setSelectedImage(null)}>
       <View style={styles.imageModalRoot} accessibilityViewIsModal>
         <Pressable style={StyleSheet.absoluteFill} accessibilityRole="button" accessibilityLabel="Close photo viewer"
           onPress={() => setSelectedImage(null)} />
@@ -1588,7 +1719,7 @@ function AppContent() {
         </> : null}
       </View>
     </Modal>
-    <Modal visible={!!echoTarget} transparent animationType="fade" onRequestClose={() => setEchoTarget(null)}>
+    <Modal visible={!!echoTarget} transparent animationType={reduceMotion ? "none" : "fade"} onRequestClose={() => setEchoTarget(null)}>
       <View style={styles.echoModalRoot}>
         <Pressable style={StyleSheet.absoluteFill} accessibilityRole="button" accessibilityLabel="Close Echo options"
           onPress={() => setEchoTarget(null)} />
@@ -1624,16 +1755,18 @@ export default function App() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#070713" },
   scroll: { flex: 1 },
-  header: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 18, paddingBottom: 13, backgroundColor: "#0b1020", borderBottomWidth: 1, borderBottomColor: "#30264a" },
+  header: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 12, paddingBottom: 13, backgroundColor: "#0b1020", borderBottomWidth: 1, borderBottomColor: "#30264a" },
+  menuToggle: { width: 42, height: 42, borderRadius: 13, alignItems: "center", justifyContent: "center", borderWidth: 1, backgroundColor: "#15172a" },
+  menuToggleText: { fontSize: 21, lineHeight: 25, fontWeight: "700" },
   logo: { width: 42, height: 42, borderRadius: 14, backgroundColor: "#17132a" },
-  brandHaloWrap: { alignItems: "center", justifyContent: "center", position: "relative", borderWidth: 1, borderColor: "#8b5fe0", shadowColor: "#8b35ff", shadowOpacity: 0.38, shadowRadius: 10, shadowOffset: { width: 0, height: 2 }, elevation: 3 },
+  brandHaloWrap: { alignItems: "center", justifyContent: "center", position: "relative", borderWidth: 1, borderColor: "#897b87", shadowColor: "#b69b8a", shadowOpacity: 0.16, shadowRadius: 5, shadowOffset: { width: 0, height: 1 }, elevation: 1 },
   quietBrandHaloWrap: { borderColor: "#51456b", shadowOpacity: 0, elevation: 0 },
-  brandHaloRing: { alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#b078ff", backgroundColor: "#292044" },
+  brandHaloRing: { alignItems: "center", justifyContent: "center", borderWidth: 2, borderColor: "#ad9aa8", backgroundColor: "#29262e" },
   quietBrandHaloRing: { borderColor: "#625481", backgroundColor: "#201a32" },
   brandCore: { alignItems: "center", justifyContent: "center", overflow: "hidden", backgroundColor: "#17132a" },
   quietBrandCore: { backgroundColor: "#17132a" },
   brandMonogram: { color: "#fbf8ff", fontFamily: "serif", fontWeight: "700" },
-  brandPulse: { position: "absolute", top: 3, right: 3, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: "#d1b6ff", backgroundColor: "#74d7ff" },
+  brandPulse: { position: "absolute", top: 3, right: 3, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5, borderColor: "#ead9cb", backgroundColor: "#c59d84" },
   quietBrandPulse: { opacity: 0.55 },
   brand: { color: "#f6f1f8", fontSize: 20, fontWeight: "800", letterSpacing: 2.4, textTransform: "uppercase" }, headerCopy: { flexShrink: 1, minWidth: 0 }, headerSub: { color: "#b8b2c3", fontSize: 12 }, userTag: { flexDirection: "row", alignItems: "center", gap: 3, marginLeft: "auto", maxWidth: 110, flexShrink: 1 }, userTagText: { color: "#e9e4ee", fontSize: 11, minWidth: 0, flexShrink: 1 },
   tabs: { flexDirection: "row", alignItems: "center", justifyContent: "space-around", backgroundColor: "#0b1020", paddingTop: 7, paddingBottom: 8, paddingHorizontal: 4, borderTopWidth: 1, borderTopColor: "#30264a" },
@@ -1646,14 +1779,27 @@ const styles = StyleSheet.create({
   tabBadge: { position: "absolute", top: -1, right: -9, minWidth: 15, height: 15, borderRadius: 8, overflow: "hidden", backgroundColor: "#8b35ff", color: "#fff", fontSize: 9, lineHeight: 15, textAlign: "center", fontWeight: "700" },
   tab: { color: "#aaa7c7", fontSize: 11, fontWeight: "600", textAlign: "center" }, activeTab: { color: "#f5f0ff" },
   content: { paddingHorizontal: 18, paddingTop: 23, paddingBottom: 24, flexGrow: 1 }, form: { marginTop: 16 },
+  settingsPanel: { padding: 14, marginVertical: 9, borderRadius: 15, backgroundColor: "#111329", borderWidth: 1, borderColor: "#393253" },
+  colorSwatch: { width: 38, height: 38, borderRadius: 11, borderWidth: 2, borderColor: "#f4f1ff" },
+  menuModalRoot: { flex: 1, flexDirection: "row", backgroundColor: "#03040bcc" },
+  menuDrawer: { width: "86%", maxWidth: 360, height: "100%", paddingHorizontal: 18, backgroundColor: "#101329", borderRightWidth: 1, borderRightColor: "#40375e" },
+  menuHeading: { minHeight: 52, flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
+  menuTitle: { color: "#f5f2ff", fontSize: 21, fontWeight: "700" },
+  menuClose: { width: 44, height: 44, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#49425f", borderRadius: 12, backgroundColor: "#171a2c" },
+  menuCloseText: { color: "#f4f1ff", fontSize: 26, lineHeight: 30 },
+  menuAccount: { flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 13, marginBottom: 8, borderTopWidth: 1, borderTopColor: "#302d4d", borderBottomWidth: 1, borderBottomColor: "#302d4d" },
+  menuAccountName: { color: "#f4f1ff", fontWeight: "700" },
+  menuItem: { minHeight: 48, justifyContent: "center", paddingHorizontal: 13, marginVertical: 3, borderRadius: 11, borderWidth: 1, borderColor: "#302d4d", backgroundColor: "#15172a" },
+  menuItemText: { color: "#ece8f7", fontSize: 15, fontWeight: "600" },
   title: { color: "#faf8ff", fontFamily: "sans-serif", fontSize: 30, fontWeight: "700", letterSpacing: -0.5, marginBottom: 8 },
   eyebrow: { color: "#c28aff", fontSize: 11, letterSpacing: 1.8, textTransform: "uppercase", fontWeight: "700" },
   section: { fontSize: 19, fontFamily: "sans-serif", fontWeight: "700", color: "#eee7f8", marginVertical: 10 },
   copy: { color: "#aaa7c7", lineHeight: 21, marginVertical: 5 }, handle: { color: "#aaa7c7", fontSize: 13 },
   input: { backgroundColor: "#0b0d1d", borderWidth: 1, borderColor: "#41395e", paddingHorizontal: 13, paddingVertical: 12, borderRadius: 12, marginVertical: 6, color: "#f4f1ff", minHeight: 46 },
   multiline: { minHeight: 82, textAlignVertical: "top" },
-  button: { backgroundColor: "#843ef1", borderRadius: 11, paddingVertical: 12, paddingHorizontal: 15, marginVertical: 5, alignItems: "center", alignSelf: "flex-start", minWidth: 96, minHeight: 44, justifyContent: "center", shadowColor: "#8b35ff", shadowOpacity: 0.24, shadowRadius: 9, shadowOffset: { width: 0, height: 3 }, elevation: 2 },
+  button: { backgroundColor: "#76677b", borderRadius: 11, paddingVertical: 12, paddingHorizontal: 15, marginVertical: 5, alignItems: "center", alignSelf: "flex-start", minWidth: 96, minHeight: 44, justifyContent: "center", shadowColor: "#000000", shadowOpacity: 0.08, shadowRadius: 4, shadowOffset: { width: 0, height: 2 }, elevation: 1 },
   buttonPressed: { opacity: 0.78, transform: [{ scale: 0.985 }] },
+  buttonPressedReduced: { opacity: 0.86 },
   buttonText: { color: "white", fontWeight: "700" }, secondary: { backgroundColor: "#17132a", borderWidth: 1, borderColor: "#40335d", shadowOpacity: 0, elevation: 0 }, secondaryText: { color: "#d9c7f5" },
   echoSelected: { backgroundColor: "#281a45", borderColor: "#a855f7" }, echoSelectedText: { color: "#e5cbff" },
   echoModalRoot: { flex: 1, justifyContent: "flex-end", backgroundColor: "#05050dcc" },
@@ -1733,6 +1879,8 @@ const styles = StyleSheet.create({
   threadOpenText: { color: "#d4bcff", fontSize: 13, fontWeight: "700" },
   startConversation: { padding: 13, marginVertical: 12, borderWidth: 1, borderColor: "#373447", borderRadius: 15, backgroundColor: "#191b29" },
   countCard: { minWidth: 72, flex: 1, padding: 10, borderRadius: 12, borderWidth: 1, borderColor: "#403b4b", backgroundColor: "#191b29" },
+  activityGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 8 },
+  activityMetric: { flexBasis: "30%", flexGrow: 1, minWidth: 88, alignItems: "center", paddingVertical: 7 },
   countValue: { color: "#f4eff7", fontSize: 19, fontWeight: "700" },
   countLabel: { color: "#aaa7c7", fontSize: 12, marginTop: 2 },
 });

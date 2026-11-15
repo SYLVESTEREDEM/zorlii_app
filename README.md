@@ -89,6 +89,7 @@ EAS requires Expo authentication and Android signing credentials; it can generat
 
 - `POST /api/auth/register`, `/register/resend`, `/register/verify`, `/login`, `/logout`, `/forgot-password`, `/reset-password`; `/api/me`
 - `GET/PATCH /api/profile`; `PUT/DELETE /api/profile/avatar`; `GET /api/avatars/{user_id}`; `GET /api/users/{username}`, `/posts`, `/followers`, and `/following`; `POST /api/users/{username}/follow`
+- `PATCH /api/settings/theme` stores the signed-in member's accent colour as a six-digit hex value in `theme_color`, so it is available through the profile across devices. The startup migration adds this preference without replacing existing account data.
 - `GET /api/blocks`; `POST /api/users/{username}/block` toggles a block; `POST /api/reports` submits a post or account report. Moderator-only report review and reported-post removal use `/api/moderation/*`.
 - `GET /api/feed?scope=all|following|bookmarks`; `POST /api/posts` supports quotes; `/api/posts/media` supports quoted posts with uploaded media; post reposts, reply reactions/reposts, and reply media use the `/api/posts/*` and `/api/replies/*` routes.
 - `GET/POST /api/conversations`; participant-only message read/send/edit/delete

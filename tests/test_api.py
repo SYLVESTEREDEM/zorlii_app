@@ -142,6 +142,20 @@ class AccountApiTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM otp_challenges").fetchone()[0], 0)
 
+    def test_theme_is_account_scoped_and_validated(self):
+        first = self.register()
+        second = self.register("other@example.test", "other", "Other")
+        first_auth = self.auth(first["token"])
+        self.assertEqual(self.client.get("/api/me", headers=first_auth).json()["user"]["theme_color"], "#a47dff")
+        response = self.client.patch("/api/settings/theme", headers=first_auth, json={"theme_color": "#AB12EF"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["user"]["theme_color"], "#ab12ef")
+        self.assertEqual(self.client.get("/api/me", headers=first_auth).json()["user"]["theme_color"], "#ab12ef")
+        self.assertEqual(self.client.get("/api/me", headers=self.auth(second["token"])).json()["user"]["theme_color"], "#a47dff")
+        self.assertEqual(self.client.patch("/api/settings/theme", headers=first_auth, json={"theme_color": "red"}).status_code, 422)
+        self.client.cookies.clear()
+        self.assertEqual(self.client.patch("/api/settings/theme", json={"theme_color": "#123456"}).status_code, 401)
+
     def test_public_policy_and_account_deletion_pages_are_available(self):
         for path, phrase in (
             ("/privacy", "Privacy Policy"),
@@ -200,6 +214,7 @@ class AccountApiTests(unittest.TestCase):
                 user = migrated.profile_for(1)
                 self.assertEqual(user["display_name"], "Existing member")
                 self.assertEqual(user["username"], "member1")
+                self.assertEqual(user["theme_color"], "#a47dff")
                 with migrated.locked_connection() as upgraded:
                     self.assertEqual(upgraded.execute(
                         "SELECT body FROM posts WHERE id=1",

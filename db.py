@@ -48,6 +48,7 @@ class Database:
                     recommendations_consent INTEGER NOT NULL DEFAULT 0,
                     context_assistance_consent INTEGER NOT NULL DEFAULT 0,
                     onboarding_completed INTEGER NOT NULL DEFAULT 0,
+                    theme_color TEXT NOT NULL DEFAULT '#a47dff',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -239,6 +240,8 @@ class Database:
                 connection.execute("ALTER TABLE profiles ADD COLUMN avatar_filename TEXT")
             if "terms_accepted_at" not in profile_columns:
                 connection.execute("ALTER TABLE profiles ADD COLUMN terms_accepted_at TEXT")
+            if "theme_color" not in profile_columns:
+                connection.execute("ALTER TABLE profiles ADD COLUMN theme_color TEXT NOT NULL DEFAULT '#a47dff'")
             post_columns = {row["name"] for row in connection.execute("PRAGMA table_info(posts)")}
             if "quoted_post_id" not in post_columns:
                 connection.execute(
@@ -283,7 +286,7 @@ class Database:
             row = connection.execute(
                 """SELECT u.id, u.email, u.username, u.created_at, p.display_name, p.bio, p.avatar_filename, p.interests,
                           p.recommendations_consent, p.context_assistance_consent,
-                          p.onboarding_completed, p.terms_accepted_at
+                          p.onboarding_completed, p.terms_accepted_at, p.theme_color
                    FROM users u JOIN profiles p ON p.user_id = u.id WHERE u.id = ?""",
                 (user_id,),
             ).fetchone()

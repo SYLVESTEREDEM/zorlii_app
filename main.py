@@ -254,6 +254,10 @@ class ReportStatusInput(BaseModel):
     status: str = Field(pattern="^(reviewed|actioned|dismissed)$")
 
 
+class ThemeSettingsInput(BaseModel):
+    theme_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+
+
 class ProfileUpdate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     display_name: str | None = Field(default=None, min_length=1, max_length=60)
@@ -1313,6 +1317,16 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
     @app.get("/api/profile")
     def profile(user: User):
+        return {"user": db.profile_for(user["id"])}
+
+    @app.patch("/api/settings/theme")
+    def update_theme(data: ThemeSettingsInput, user: User):
+        require_terms_accepted(user["id"])
+        with db.transaction() as connection:
+            connection.execute(
+                "UPDATE profiles SET theme_color = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                (data.theme_color.lower(), user["id"]),
+            )
         return {"user": db.profile_for(user["id"])}
 
     @app.get("/api/account/export")

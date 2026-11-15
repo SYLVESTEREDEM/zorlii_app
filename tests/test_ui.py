@@ -128,7 +128,9 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn("function BrandHalo(", mobile)
         self.assertIn("<BrandHalo size={42} showLogo />", mobile)
         self.assertIn("<BrandHalo size={58} quiet />", mobile)
-        self.assertIn("More &amp; account safety", html)
+        self.assertIn('data-go="settings"', html)
+        self.assertIn("async function renderSettings()", html)
+        self.assertIn("Community safety", html)
         self.assertIn('disclosure("account-help", "Notifications, help & account"', mobile)
         self.assertIn('data-go="blocks"', html)
         self.assertIn('setScreen("blocked")', mobile)
@@ -205,7 +207,8 @@ class WebUiRegressionTests(unittest.TestCase):
         self.assertIn('label="Attach photos, videos, or GIFs to post"', mobile)
         self.assertIn('label="Attach photos, videos, or GIFs to reply"', mobile)
         self.assertIn("mediaPickerButton:", mobile)
-        self.assertIn('<Text style={styles.mediaPickerIcon} accessibilityElementsHidden>+</Text>', mobile)
+        self.assertIn("style={[styles.mediaPickerIcon, { color: readableAccent(activeThemeAccent) }]} accessibilityElementsHidden", mobile)
+        self.assertIn("accessibilityElementsHidden>+</Text>", mobile)
 
     def test_web_media_remove_uses_large_keyboard_accessible_hit_area(self):
         html = (ROOT / "index.html").read_text(encoding="utf-8")
@@ -266,23 +269,42 @@ class WebUiRegressionTests(unittest.TestCase):
         profile = html.split("async function renderProfile()", 1)[1].split(
             "async function renderProfilePosts", 1
         )[0]
+        profile_view = html.split("async function renderProfile()", 1)[1].split(
+            "async function renderSettings", 1
+        )[0]
 
         self.assertNotIn("u.email", profile)
         self.assertIn('class="avatar-plus" data-action="avatar-pick" aria-label="Upload profile photo"', profile)
         self.assertIn('id="profile-posts"', profile)
         self.assertIn('data-go="social-followers"', profile)
         self.assertIn('data-go="social-following"', profile)
-        self.assertIn("name=\"bio\"", profile)
-        self.assertIn("Edit profile & preferences", html)
-        self.assertIn("if(screen==='profile')wrapProfileEditor()", html)
+        self.assertNotIn("name=\"bio\"", profile_view)
+        self.assertIn('data-go="settings"', html)
+        settings = html.split("async function renderSettings()", 1)[1].split(
+            "async function renderProfilePosts", 1
+        )[0]
+        self.assertIn('id="profile-form"', settings)
+        self.assertIn("name=\"bio\"", settings)
         feed = html.split("async function renderFeed", 1)[1].split("function replyMarkup", 1)[0]
         self.assertIn('<span aria-hidden="true">+</span>', feed)
-        self.assertIn("Privacy &amp; local tools", profile)
-        self.assertIn("Help &amp; local context", profile)
-        self.assertIn("More &amp; account safety", profile)
+        self.assertIn("Privacy &amp; local tools", settings)
+        self.assertIn("Local context &amp; help", settings)
+        self.assertIn("Community safety", settings)
         self.assertIn("`/api/users/${encodeURIComponent(state.username)}/posts`", html)
         self.assertIn('data-action="zoom-media"', html)
         self.assertIn("class=\"post-media\"", html)
+
+    def test_phone_profile_reserves_drawer_space_and_compacts_activity_summary(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn(".main>.eyebrow:first-child{display:flex;align-items:center;min-height:44px;padding-left:52px}", html)
+        self.assertIn(".activity-counts{grid-template-columns:repeat(4,minmax(0,1fr))", html)
+        self.assertIn(".nav button,.sidebar .nav button{font-size:12px}", html)
+        profile = mobile.split('if (screen === "profile") return', 1)[1].split(
+            'if (screen === "settings") return', 1
+        )[0]
+        self.assertIn('<View style={styles.activityGrid}>', profile)
+        self.assertIn("styles.activityMetric", profile)
 
     def test_web_mention_activities_link_to_the_mentioned_post(self):
         html = (ROOT / "index.html").read_text(encoding="utf-8")
@@ -350,27 +372,147 @@ class WebUiRegressionTests(unittest.TestCase):
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise the web JavaScript")
-    def test_profile_editor_disclosure_keeps_the_existing_form(self):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise web drawer state")
+    def test_web_drawer_open_state_updates_accessibility_and_focus(self):
         html = (ROOT / "index.html").read_text(encoding="utf-8")
-        wrapper = next(line for line in html.splitlines() if "function wrapProfileEditor()" in line)
+        web_script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        drawer_function = web_script.split("function setDrawerOpen", 1)[1].split(
+            "function drawerMarkup", 1
+        )[0]
         script = """
         const assert=require('node:assert/strict');
-        const form={before(node){this.container=node},bio:'editable'};
-        const document={getElementById:()=>form,createElement:tag=>({
-          tag,append(...children){this.children=children}
-        })};
-        """ + wrapper + """
-        wrapProfileEditor();
-        assert.equal(form.container.tag,'details');
-        assert.equal(form.container.open,undefined);
-        assert.equal(form.container.children[0].tag,'summary');
-        assert.equal(form.container.children[0].textContent,'Edit profile & preferences');
-        assert.equal(form.container.children[1],form);
-        assert.equal(form.bio,'editable');
+        const makeClassList=()=>{const values=new Set();return {
+          toggle(name,force){const open=force??!values.has(name);open?values.add(name):values.delete(name);return open},
+          contains(name){return values.has(name)}
+        }};
+        const attrs={};let focused='';
+        const first={focus(){focused='first'}},toggle={focus(){focused='toggle'},setAttribute(name,value){attrs[`toggle-${name}`]=value}};
+        const drawer={classList:makeClassList(),setAttribute(name,value){attrs[name]=value},
+          querySelector(){return first},inert:true};
+        const scrim={classList:makeClassList()};
+        const document={getElementById:id=>id==='app-drawer'?drawer:scrim,querySelector:()=>toggle};
+        """ + "function setDrawerOpen" + drawer_function + """
+        setDrawerOpen(true);
+        assert.equal(drawer.classList.contains('open'),true);
+        assert.equal(scrim.classList.contains('open'),true);
+        assert.equal(attrs['aria-hidden'],'false');
+        assert.equal(drawer.inert,false);
+        assert.equal(attrs['toggle-aria-expanded'],'true');
+        assert.equal(focused,'first');
+        setDrawerOpen(false);
+        assert.equal(drawer.classList.contains('open'),false);
+        assert.equal(scrim.classList.contains('open'),false);
+        assert.equal(attrs['aria-hidden'],'true');
+        assert.equal(drawer.inert,true);
+        assert.equal(attrs['toggle-aria-expanded'],'false');
+        assert.equal(focused,'toggle');
         """
         result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise web date formatting")
+    def test_joined_dates_use_ordinals_and_omit_missing_or_invalid_values(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        web_script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        date_helpers = web_script.split("function parseTimestamp", 1)[1].split(
+            "function normalizedHex", 1
+        )[0]
+        script = """
+        const assert=require('node:assert/strict');
+        """ + "function parseTimestamp" + date_helpers + """
+        assert.equal(formatJoinedDate('2026-06-23T00:00:00Z'),'Joined 23rd June, 2026');
+        assert.equal(formatJoinedDate('2026-06-01'),'Joined 1st June, 2026');
+        assert.equal(formatJoinedDate('2026-06-02'),'Joined 2nd June, 2026');
+        assert.equal(formatJoinedDate('2026-06-11'),'Joined 11th June, 2026');
+        assert.equal(formatJoinedDate(''), '');
+        assert.equal(formatJoinedDate('not-a-date'), '');
+        """
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn("function formatJoinedDate(value?: string | null)", mobile)
+        self.assertIn("formatJoinedDate(me?.joined_at || me?.created_at)", mobile)
+        self.assertIn("formatJoinedDate(publicProfile.joined_at || publicProfile.created_at)", mobile)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise web theme synchronization")
+    def test_theme_sync_merges_account_fields_and_keeps_extreme_accents_readable(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        web_script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        theme_helpers = web_script.split("function normalizedHex", 1)[1].split(
+            "function drawerMarkup", 1
+        )[0]
+        script = """
+        const assert=require('node:assert/strict');
+        let me={username:'reader',bio:'kept',display_name:'Reader'};
+        const vars={},nodes={};
+        const document={
+          documentElement:{style:{setProperty(name,value){vars[name]=value}}},
+          getElementById:id=>nodes[id]||null,
+          createElement:()=>({}),
+          head:{appendChild(node){nodes[node.id]=node}}
+        };
+        """ + "function normalizedHex" + theme_helpers + """
+        updateMe({theme_color:'#000000'});
+        assert.equal(me.bio,'kept');
+        assert.equal(me.username,'reader');
+        assert.equal(vars['--accent-ink'],'#11111b');
+        assert.notEqual(vars['--accent-ui'],'#000000');
+        assert.match(nodes['account-theme-styles'].textContent,/var\\(--accent-ui\\)/);
+        updateMe({theme_color:'#ffffff'});
+        assert.equal(vars['--accent-ink'],'#11111b');
+        assert.equal(vars['--accent'],'#ffffff');
+        """
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn("setMe(current => current ? { ...current, ...user } as User : user as User)", mobile)
+        self.assertIn('request("/api/settings/theme", "PATCH", { theme_color: color.toLowerCase() })', mobile)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed to exercise web theme validation")
+    def test_theme_save_rejects_bad_hex_and_propagates_server_errors(self):
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        web_script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        normalizer = web_script.split("function normalizedHex", 1)[1].split(
+            "function accentForeground", 1
+        )[0]
+        save_helper = web_script.split("async function saveThemePreference", 1)[1].split(
+            "function setDrawerOpen", 1
+        )[0]
+        script = """
+        const assert=require('node:assert/strict');
+        let calls=[],updated=null,api=async(path,options)=>{calls.push([path,options]);return {user:{theme_color:'#abcdef'}}};
+        function updateMe(user){updated=user}
+        """ + "function normalizedHex" + normalizer + "async function saveThemePreference" + save_helper + """
+        (async()=>{
+          await assert.rejects(saveThemePreference('#abc'),/valid hex colour/);
+          assert.equal(calls.length,0);
+          const user=await saveThemePreference('#ABCDEF');
+          assert.equal(calls[0][0],'/api/settings/theme');
+          assert.equal(JSON.parse(calls[0][1].body).theme_color,'#abcdef');
+          assert.equal(updated,user);
+          api=async()=>{throw new Error('offline')};
+          await assert.rejects(saveThemePreference('#ffffff'),/offline/);
+          assert.match('catch(err){toast(err.message)}',/toast\\(err.message\\)/);
+        })().catch(error=>{console.error(error);process.exitCode=1});
+        """
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('catch(err){toast(err.message)}', web_script)
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        self.assertIn('if (!validHexColor(color)) { setError("Enter a six-digit hex colour', mobile)
+        self.assertIn('const result = await request("/api/settings/theme", "PATCH"', mobile)
+        self.assertIn("} catch (e) { fail(e); }", mobile)
+
+    def test_mobile_screen_transitions_and_modals_respect_reduce_motion(self):
+        mobile = (ROOT / "mobile" / "App.tsx").read_text(encoding="utf-8")
+        update_me = mobile.split("function updateMe(", 1)[1].split("async function request", 1)[0]
+        self.assertIn("AccessibilityInfo.isReduceMotionEnabled()", mobile)
+        self.assertIn('AccessibilityInfo.addEventListener("reduceMotionChanged", setReduceMotion)', mobile)
+        self.assertNotIn("useEffect", update_me.split("  useEffect", 1)[0])
+        self.assertIn("if (reduceMotion) {\n      screenOpacity.setValue(1);\n      screenOffset.setValue(0);", mobile)
+        self.assertIn("Animated.timing(screenOpacity, { toValue: 1, duration: 150", mobile)
+        self.assertGreaterEqual(mobile.count('animationType={reduceMotion ? "none" : "fade"}'), 3)
+        self.assertIn("buttonPressedReduced: { opacity: 0.86 }", mobile)
 
 
 if __name__ == "__main__":
