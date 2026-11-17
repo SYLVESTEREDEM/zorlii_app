@@ -11,7 +11,7 @@ import hashlib
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.error import URLError
 from urllib.request import Request as URLRequest, urlopen
 
@@ -144,9 +144,9 @@ def post_media_type(content, declared_type):
 class RegisterInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     email: str = Field(min_length=3, max_length=254)
-    username: str = Field(min_length=3, max_length=24)
+    username: str | None = Field(default=None, min_length=3, max_length=24)
     password: str = Field(min_length=4, max_length=128)
-    display_name: str = Field(min_length=1, max_length=60)
+    display_name: str | None = Field(default=None, min_length=1, max_length=60)
     accept_terms: bool = False
 
     @field_validator("email")
@@ -160,10 +160,11 @@ class RegisterInput(BaseModel):
     @field_validator("username")
     @classmethod
     def valid_username(cls, value):
-        value = value.lower()
+        if value is None:
+            return None
         if not USERNAME_RE.fullmatch(value):
             raise ValueError("Use 3–24 letters, numbers, or underscores.")
-        return value
+        return value.lower()
 
     @field_validator("password")
     @classmethod
@@ -267,13 +268,27 @@ class ThemeSettingsInput(BaseModel):
     theme_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
 
 
+class LanguageSettingsInput(BaseModel):
+    language: Literal["en-US", "fr-FR", "es-ES", "ar", "hi-IN", "ur"]
+
+
 class ProfileUpdate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
+    username: str | None = Field(default=None, min_length=3, max_length=24)
     display_name: str | None = Field(default=None, min_length=1, max_length=60)
     bio: str | None = Field(default=None, max_length=280)
     interests: list[str] | None = Field(default=None, max_length=12)
     recommendations_consent: bool | None = None
     context_assistance_consent: bool | None = None
+
+    @field_validator("username")
+    @classmethod
+    def valid_username(cls, value):
+        if value is None:
+            raise ValueError("Username cannot be empty.")
+        if not USERNAME_RE.fullmatch(value):
+            raise ValueError("Use 3–24 letters, numbers, or underscores.")
+        return value.lower()
 
     @field_validator("interests")
     @classmethod
@@ -300,6 +315,19 @@ class PostInput(BaseModel):
     @classmethod
     def non_whitespace(cls, value):
         return value.strip()
+
+
+class PostEditInput(BaseModel):
+    body: str = Field(max_length=5000)
+
+    @field_validator("body")
+    @classmethod
+    def trim_body(cls, value):
+        return value.strip()
+
+
+class ReplyEditInput(PostEditInput):
+    body: str = Field(max_length=4000)
 
 
 class MediaPostInput(BaseModel):
@@ -484,7 +512,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                    ON CONFLICT(user_id,game) DO UPDATE SET run_id=excluded.run_id,revision=0,state=excluded.state""",
                 (user["id"], game, run_id, json.dumps(state)),
             )
-        return {"run_id": run_id, "revision": 0, "state": state, "server_time": time.time()}
+        return {"run_id": run_id, "revision": 0, "state": games.public_state(state), "server_time": time.time()}
 
     @app.get("/api/games/{game}/run")
     def current_game(game: str, user: User):
@@ -495,7 +523,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 (user["id"], game),
             ).fetchone()
         return {"run": {"run_id": row["run_id"], "revision": row["revision"],
-                        "state": json.loads(row["state"]), "server_time": time.time()} if row else None}
+                        "state": games.public_state(json.loads(row["state"])), "server_time": time.time()} if row else None}
 
     @app.post("/api/games/{game}/move")
     def move_game(game: str, data: GameMoveInput, user: User):
@@ -527,7 +555,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                        WHERE excluded.score>game_scores.score""",
                     (user["id"], game, state["score"]),
                 )
-        return {"run_id": data.run_id, "revision": revision, "state": state, "server_time": time.time()}
+        return {"run_id": data.run_id, "revision": revision, "state": games.public_state(state), "server_time": time.time()}
 
     def is_blocked(connection, user_id, other_user_id):
         return bool(connection.execute(
@@ -591,26 +619,33 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         if not isinstance(result, dict):
             PUSH_LOGGER.error("Expo push response was not a JSON object")
             return
-        tickets = result.get("data", [])
+        tickets = result.get("data")
         if not isinstance(tickets, list):
             PUSH_LOGGER.error("Expo push response did not contain a ticket list")
             return
-        dead_tokens = [
-            tokens[index] for index, ticket in enumerate(tickets)
-            if index < len(tokens)
-            and isinstance(ticket, dict)
-            and ticket.get("status") == "error"
-            and (ticket.get("details") or {}).get("error") == "DeviceNotRegistered"
-        ]
+        if len(tickets) != len(tokens):
+            PUSH_LOGGER.warning("Expo push returned %d tickets for %d devices", len(tickets), len(tokens))
+        dead_tokens = []
+        error_counts = {}
+        known_errors = {"DeviceNotRegistered", "MessageTooBig", "MessageRateExceeded",
+                        "MismatchSenderId", "InvalidCredentials"}
+        for index, ticket in enumerate(tickets):
+            if not isinstance(ticket, dict) or ticket.get("status") not in {"ok", "error"}:
+                PUSH_LOGGER.error("Expo push returned an invalid ticket")
+                continue
+            if ticket["status"] != "error":
+                continue
+            details = ticket.get("details")
+            code = details.get("error") if isinstance(details, dict) else None
+            safe_code = code if isinstance(code, str) and code in known_errors else "Other"
+            error_counts[safe_code] = error_counts.get(safe_code, 0) + 1
+            if safe_code == "DeviceNotRegistered" and index < len(tokens):
+                dead_tokens.append(tokens[index])
         if dead_tokens:
             with db.transaction() as connection:
                 connection.executemany("DELETE FROM push_tokens WHERE token=?", [(token,) for token in dead_tokens])
-        errors = sum(
-            isinstance(ticket, dict) and ticket.get("status") == "error"
-            for ticket in tickets
-        )
-        if errors:
-            PUSH_LOGGER.warning("Expo push delivery returned %d error ticket(s)", errors)
+        for code, count in error_counts.items():
+            PUSH_LOGGER.warning("Expo push delivery returned %d %s error ticket(s)", count, code)
 
     def schedule_push(background_tasks, user_id, title, body, data):
         background_tasks.add_task(send_push_notification, user_id, title, body, data)
@@ -755,11 +790,12 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             ],
         }
 
-    def add_mentions(connection, body, actor_id, post_id, reply_id=None):
+    def add_mentions(connection, body, actor_id, post_id, reply_id=None, *, exclude_usernames=None):
         recipients = []
-        for username in {match.group(1).lower() for match in MENTION_RE.finditer(body)}:
+        usernames = {match.group(1).lower() for match in MENTION_RE.finditer(body)}
+        for username in usernames - (exclude_usernames or set()):
             target = connection.execute(
-                "SELECT id FROM users WHERE username=?", (username,),
+                "SELECT id FROM users WHERE lower(username)=? ORDER BY id LIMIT 1", (username,),
             ).fetchone()
             if target is None or target["id"] == actor_id:
                 continue
@@ -1088,6 +1124,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         challenge_id = None
 
         with db.transaction() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM otp_challenges WHERE expires_at<=?", (now,))
             connection.execute("DELETE FROM otp_rate_limits WHERE created_at<=?", (now - OTP_RATE_WINDOW,))
 
@@ -1237,6 +1274,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         outcome = None
         try:
             with db.transaction() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 challenge = connection.execute(
                     "SELECT * FROM otp_challenges WHERE purpose='register' AND email=?",
                     (data.email,),
@@ -1259,11 +1297,22 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                         )
                         outcome = "invalid"
                 else:
+                    username = challenge["username"]
+                    if username is None:
+                        while True:
+                            username = "member_" + secrets.token_hex(6)
+                            if not connection.execute(
+                                """SELECT 1 FROM users WHERE lower(username)=?
+                                   UNION ALL SELECT 1 FROM otp_challenges
+                                   WHERE purpose='register' AND lower(username)=? AND expires_at>? LIMIT 1""",
+                                (username, username, now),
+                            ).fetchone():
+                                break
                     email_exists = connection.execute(
                         "SELECT 1 FROM users WHERE lower(email)=?", (data.email,)
                     ).fetchone()
                     username_exists = connection.execute(
-                        "SELECT 1 FROM users WHERE lower(username)=?", (challenge["username"],)
+                        "SELECT 1 FROM users WHERE lower(username)=?", (username,)
                     ).fetchone()
                     if email_exists or username_exists:
                         connection.execute("DELETE FROM otp_challenges WHERE id=?", (challenge["id"],))
@@ -1271,13 +1320,13 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                     else:
                         cursor = connection.execute(
                             "INSERT INTO users(email,username,password_hash) VALUES(?,?,?)",
-                            (data.email, challenge["username"], challenge["password_hash"]),
+                            (data.email, username, challenge["password_hash"]),
                         )
                         user_id = cursor.lastrowid
                         connection.execute(
                             """INSERT INTO profiles(user_id,display_name,terms_accepted_at)
                                VALUES(?,?,CURRENT_TIMESTAMP)""",
-                            (user_id, challenge["display_name"]),
+                            (user_id, challenge["display_name"] or username),
                         )
                         token = new_session_token()
                         connection.execute(
@@ -1423,6 +1472,15 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             )
         return {"user": db.profile_for(user["id"])}
 
+    @app.patch("/api/settings/language")
+    def update_language(data: LanguageSettingsInput, user: User):
+        with db.transaction() as connection:
+            connection.execute(
+                "UPDATE profiles SET language = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                (data.language, user["id"]),
+            )
+        return {"user": db.profile_for(user["id"])}
+
     @app.get("/api/account/export")
     def export_account(user: User):
         with db.locked_connection() as connection:
@@ -1527,7 +1585,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             "conversations": conversations,
             "notifications_received": [dict(row) for row in notifications],
             "game_scores": [dict(row) for row in game_scores],
-            "game_progress": [{"game": row["game"], "revision": row["revision"], "state": json.loads(row["state"])} for row in game_runs],
+            "game_progress": [{"game": row["game"], "revision": row["revision"], "state": games.public_state(json.loads(row["state"]))} for row in game_runs],
         }
         return Response(
             content=json.dumps(export, ensure_ascii=False, indent=2),
@@ -1584,14 +1642,32 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         require_terms_accepted(user["id"])
         changes = data.model_dump(exclude_unset=True)
         if changes:
+            username = changes.pop("username", None)
             if "interests" in changes:
                 changes["interests"] = json.dumps(changes["interests"])
             assignments = [f"{key} = ?" for key in changes]
             values = [int(value) if key.endswith("_consent") else value for key, value in changes.items()]
             assignments.append("updated_at = CURRENT_TIMESTAMP")
             values.append(user["id"])
-            with db.transaction() as connection:
-                connection.execute(f"UPDATE profiles SET {', '.join(assignments)} WHERE user_id = ?", values)
+            try:
+                with db.transaction() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    if username is not None:
+                        current = connection.execute("SELECT username FROM users WHERE id=?", (user["id"],)).fetchone()
+                        if current["username"] != username:
+                            if connection.execute(
+                                """SELECT 1 FROM users WHERE lower(username)=? AND id<>?
+                                   UNION ALL SELECT 1 FROM otp_challenges
+                                   WHERE purpose='register' AND lower(username)=? AND expires_at>? LIMIT 1""",
+                                (username, user["id"], username, int(time.time())),
+                            ).fetchone():
+                                raise HTTPException(status_code=409, detail="That username is already taken.")
+                            connection.execute("UPDATE users SET username=? WHERE id=?", (username, user["id"]))
+                    connection.execute(f"UPDATE profiles SET {', '.join(assignments)} WHERE user_id = ?", values)
+            except sqlite3.IntegrityError as exc:
+                if "username" not in str(exc).lower():
+                    raise
+                raise HTTPException(status_code=409, detail="That username is already taken.") from exc
         return {"user": db.profile_for(user["id"])}
 
     @app.get("/api/users/{username}")
@@ -1599,7 +1675,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         with db.locked_connection() as connection:
             row = connection.execute(
                 """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename
-                   FROM users u JOIN profiles p ON p.user_id=u.id WHERE u.username=?""",
+                   FROM users u JOIN profiles p ON p.user_id=u.id WHERE lower(u.username)=? ORDER BY u.id LIMIT 1""",
                 (username.lower().lstrip("@"),),
             ).fetchone()
             if row is None:
@@ -1622,7 +1698,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         before_id: int | None = Query(default=None, ge=1),
     ):
         with db.locked_connection() as connection:
-            target = connection.execute("SELECT id FROM users WHERE username=?", (username.lower().lstrip("@"),)).fetchone()
+            target = connection.execute("SELECT id FROM users WHERE lower(username)=? ORDER BY id LIMIT 1", (username.lower().lstrip("@"),)).fetchone()
             if target is None:
                 raise HTTPException(status_code=404, detail="Profile not found.")
             if target["id"] != user["id"] and is_blocked(connection, user["id"], target["id"]):
@@ -1648,7 +1724,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         source_column = "follower_id" if relationship == "followers" else "followed_id"
         with db.locked_connection() as connection:
             target = connection.execute(
-                "SELECT id FROM users WHERE username=?",
+                "SELECT id FROM users WHERE lower(username)=? ORDER BY id LIMIT 1",
                 (username.lower().lstrip("@"),),
             ).fetchone()
             if target is None:
@@ -1709,8 +1785,9 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
     @app.post("/api/users/{username}/block")
     def toggle_block(username: str, user: User):
         with db.transaction() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             target = connection.execute(
-                "SELECT id FROM users WHERE lower(username)=?",
+                "SELECT id FROM users WHERE lower(username)=? ORDER BY id LIMIT 1",
                 (username.lower().lstrip("@"),),
             ).fetchone()
             if target is None:
@@ -1839,7 +1916,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
     @app.post("/api/users/{username}/follow")
     def toggle_follow(username: str, background_tasks: BackgroundTasks, user: User):
         with db.transaction() as connection:
-            target = connection.execute("SELECT id FROM users WHERE username=?", (username.lower().lstrip("@"),)).fetchone()
+            connection.execute("BEGIN IMMEDIATE")
+            target = connection.execute("SELECT id FROM users WHERE lower(username)=? ORDER BY id LIMIT 1", (username.lower().lstrip("@"),)).fetchone()
             if target is None:
                 raise HTTPException(status_code=404, detail="Profile not found.")
             if target["id"] == user["id"]:
@@ -2033,20 +2111,10 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             elif scope == "bookmarks":
                 where += " AND EXISTS(SELECT 1 FROM bookmarks b WHERE b.user_id=? AND b.post_id=p.id)"
                 params.append(user["id"])
-            params.extend((user["id"], user["id"], user["id"], user["id"], limit, offset))
+            params.extend((limit, offset))
             ids = connection.execute(
                 f"""SELECT p.id FROM posts p WHERE {where}
-                    ORDER BY COALESCE((
-                        SELECT MAX(rr.created_at) FROM post_reposts rr
-                        WHERE rr.post_id=p.id AND
-                            (rr.user_id=? OR EXISTS(
-                                SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=rr.user_id
-                            )) AND NOT EXISTS(
-                                SELECT 1 FROM blocked_users b
-                                WHERE (b.blocker_id=? AND b.blocked_id=rr.user_id)
-                                   OR (b.blocker_id=rr.user_id AND b.blocked_id=?)
-                            )
-                    ),p.created_at) DESC,p.id DESC LIMIT ? OFFSET ?""",
+                    ORDER BY p.created_at DESC,p.id DESC LIMIT ? OFFSET ?""",
                 params,
             ).fetchall()
             results = []
@@ -2058,24 +2126,55 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
             return {"posts": results, "limit": limit, "offset": offset}
 
     @app.get("/api/posts/{post_id}")
-    def get_post(post_id: int, user: User):
+    def get_post(
+        post_id: int,
+        user: User,
+        after_id: int | None = Query(default=None, ge=1),
+        limit: int = Query(default=100, ge=1, le=100),
+    ):
         with db.locked_connection() as connection:
             row = visible_post(connection, post_id, user["id"])
             if row is None:
                 raise HTTPException(status_code=404, detail="Post not found.")
             replies = connection.execute(
                 """SELECT r.id FROM replies r JOIN users u ON u.id=r.user_id
-                   WHERE r.post_id=? AND NOT EXISTS(SELECT 1 FROM blocked_users b
+                   WHERE r.post_id=? AND (? IS NULL OR r.id>?)
+                   AND NOT EXISTS(SELECT 1 FROM blocked_users b
                        WHERE (b.blocker_id=? AND b.blocked_id=u.id)
                           OR (b.blocker_id=u.id AND b.blocked_id=?))
-                   ORDER BY r.id LIMIT 100""",
-                (post_id, user["id"], user["id"]),
+                   ORDER BY r.id LIMIT ?""",
+                (post_id, after_id, after_id, user["id"], user["id"], limit + 1),
             ).fetchall()
+            has_more = len(replies) > limit
+            page = replies[:limit]
             reply_payloads = [
-                reply for item in replies
+                reply for item in page
                 if (reply := visible_reply(connection, item["id"], user["id"])) is not None
             ]
-        return {"post": post_payload(row), "replies": reply_payloads}
+        return {
+            "post": post_payload(row),
+            "replies": reply_payloads,
+            "has_more": has_more,
+            "next_after_id": page[-1]["id"] if has_more else None,
+        }
+
+    @app.patch("/api/posts/{post_id}")
+    def edit_post(post_id: int, data: PostEditInput, background_tasks: BackgroundTasks, user: User):
+        require_terms_accepted(user["id"])
+        with db.transaction() as connection:
+            post = visible_post(connection, post_id, user["id"])
+            if post is None or post["user_id"] != user["id"]:
+                raise HTTPException(status_code=404, detail="Post not found or unavailable.")
+            if not data.body and not post["media"] and not post["quoted_post_id"] and not post["quoted_reply_id"]:
+                raise HTTPException(status_code=422, detail="Write a post or keep its media or quoted item.")
+            previous_mentions = {match.group(1).lower() for match in MENTION_RE.finditer(post["body"])}
+            connection.execute("UPDATE posts SET body=? WHERE id=?", (data.body, post_id))
+            mentioned = add_mentions(
+                connection, data.body, user["id"], post_id, exclude_usernames=previous_mentions,
+            )
+            updated = visible_post(connection, post_id, user["id"])
+        push_mentions(background_tasks, mentioned, user["username"], post_id)
+        return {"post": post_payload(updated)}
 
     @app.delete("/api/posts/{post_id}")
     def delete_post(post_id: int, user: User):
@@ -2221,18 +2320,49 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         finally:
             await form.close()
 
+    @app.patch("/api/replies/{reply_id}")
+    def edit_reply(reply_id: int, data: ReplyEditInput, background_tasks: BackgroundTasks, user: User):
+        require_terms_accepted(user["id"])
+        with db.transaction() as connection:
+            reply = visible_reply(connection, reply_id, user["id"])
+            if reply is None or reply["author"]["id"] != user["id"]:
+                raise HTTPException(status_code=404, detail="Reply not found or unavailable.")
+            if not data.body and not reply["media"]:
+                raise HTTPException(status_code=422, detail="Write a reply or keep its media.")
+            previous_mentions = {match.group(1).lower() for match in MENTION_RE.finditer(reply["body"])}
+            connection.execute("UPDATE replies SET body=? WHERE id=?", (data.body, reply_id))
+            mentioned = add_mentions(
+                connection, data.body, user["id"], reply["post_id"], reply_id,
+                exclude_usernames=previous_mentions,
+            )
+            updated = visible_reply(connection, reply_id, user["id"])
+        push_mentions(background_tasks, mentioned, user["username"], reply["post_id"], reply_id)
+        return updated
+
     @app.delete("/api/replies/{reply_id}")
     def delete_reply(reply_id: int, user: User):
-        with db.locked_connection() as connection:
+        with db.transaction() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM replies WHERE id=? AND user_id=?", (reply_id, user["id"])
+            ).fetchone():
+                raise HTTPException(status_code=404, detail="Reply not found or unavailable.")
             media_rows = connection.execute(
-                "SELECT filename FROM reply_media WHERE reply_id=?",
-                (reply_id,),
+                """SELECT filename FROM reply_media WHERE reply_id=?
+                   UNION ALL
+                   SELECT filename FROM post_media WHERE post_id IN (
+                       SELECT share_post_id FROM reply_reposts WHERE reply_id=?
+                   )
+                   UNION ALL
+                   SELECT rm.filename FROM reply_media rm JOIN replies r ON r.id=rm.reply_id
+                   WHERE r.post_id IN (
+                       SELECT share_post_id FROM reply_reposts WHERE reply_id=?
+                   )""",
+                (reply_id, reply_id, reply_id),
             ).fetchall()
             repost_rows = connection.execute(
                 "SELECT share_post_id FROM reply_reposts WHERE reply_id=?",
                 (reply_id,),
             ).fetchall()
-        with db.transaction() as connection:
             cursor = connection.execute(
                 "DELETE FROM replies WHERE id=? AND user_id=?", (reply_id, user["id"])
             )
@@ -2240,8 +2370,8 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 raise HTTPException(status_code=404, detail="Reply not found or unavailable.")
             for repost in repost_rows:
                 connection.execute(
-                    "DELETE FROM posts WHERE id=? AND user_id=?",
-                    (repost["share_post_id"], user["id"]),
+                    "DELETE FROM posts WHERE id=?",
+                    (repost["share_post_id"],),
                 )
         for media_row in media_rows:
             if re.fullmatch(r"[a-f0-9]{32}\.(?:jpg|png|webp|gif|mp4|mov|webm)", media_row["filename"]):
@@ -2454,13 +2584,14 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
         search_value = query.lstrip("@") if username_query else query
         if not search_value:
             raise HTTPException(status_code=422, detail="Enter a username after @.")
-        term = f"%{search_value}%"
+        escaped_value = search_value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        term = f"%{escaped_value}%"
         name_term = "" if username_query else term
         with db.locked_connection() as connection:
             people = connection.execute(
                 """SELECT u.id,u.username,u.created_at,p.display_name,p.bio,p.avatar_filename FROM users u
                    JOIN profiles p ON p.user_id=u.id
-                   WHERE (u.username LIKE ? OR p.display_name LIKE ?)
+                   WHERE (u.username LIKE ? ESCAPE '\\' OR p.display_name LIKE ? ESCAPE '\\')
                      AND NOT EXISTS(SELECT 1 FROM blocked_users b
                          WHERE (b.blocker_id=? AND b.blocked_id=u.id)
                             OR (b.blocker_id=u.id AND b.blocked_id=?))
@@ -2468,7 +2599,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
                 (term, name_term, user["id"], user["id"]),
             ).fetchall()
             post_ids = connection.execute(
-                """SELECT p.id FROM posts p WHERE p.body LIKE ? AND
+                """SELECT p.id FROM posts p WHERE p.body LIKE ? ESCAPE '\\' AND
                    (p.user_id=? OR p.visibility='public' OR
                     (p.visibility='followers' AND EXISTS(
                        SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=p.user_id)))
@@ -2518,7 +2649,7 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
     def create_conversation(data: ConversationInput, user: User):
         require_terms_accepted(user["id"])
         with db.transaction() as connection:
-            recipient = connection.execute("SELECT id FROM users WHERE username=?", (data.username,)).fetchone()
+            recipient = connection.execute("SELECT id FROM users WHERE lower(username)=? ORDER BY id LIMIT 1", (data.username,)).fetchone()
             if recipient is None:
                 raise HTTPException(status_code=404, detail="Account not found.")
             if recipient["id"] == user["id"]:

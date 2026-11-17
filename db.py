@@ -49,6 +49,7 @@ class Database:
                     context_assistance_consent INTEGER NOT NULL DEFAULT 0,
                     onboarding_completed INTEGER NOT NULL DEFAULT 0,
                     theme_color TEXT NOT NULL DEFAULT '#a47dff',
+                    language TEXT NOT NULL DEFAULT 'en-US',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -251,6 +252,17 @@ class Database:
             if "username" not in columns:
                 connection.execute("ALTER TABLE users ADD COLUMN username TEXT")
             connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username) WHERE username IS NOT NULL")
+            connection.execute("CREATE INDEX IF NOT EXISTS users_username_lower ON users(lower(username))")
+            connection.executescript("""
+                CREATE TRIGGER IF NOT EXISTS users_username_ci_insert
+                BEFORE INSERT ON users WHEN NEW.username IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM users WHERE lower(username) = lower(NEW.username)
+                ) BEGIN SELECT RAISE(ABORT, 'username already taken'); END;
+                CREATE TRIGGER IF NOT EXISTS users_username_ci_update
+                BEFORE UPDATE OF username ON users WHEN NEW.username IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM users WHERE id != OLD.id AND lower(username) = lower(NEW.username)
+                ) BEGIN SELECT RAISE(ABORT, 'username already taken'); END;
+            """)
             profile_columns = {row["name"] for row in connection.execute("PRAGMA table_info(profiles)")}
             if "avatar_filename" not in profile_columns:
                 connection.execute("ALTER TABLE profiles ADD COLUMN avatar_filename TEXT")
@@ -258,6 +270,8 @@ class Database:
                 connection.execute("ALTER TABLE profiles ADD COLUMN terms_accepted_at TEXT")
             if "theme_color" not in profile_columns:
                 connection.execute("ALTER TABLE profiles ADD COLUMN theme_color TEXT NOT NULL DEFAULT '#a47dff'")
+            if "language" not in profile_columns:
+                connection.execute("ALTER TABLE profiles ADD COLUMN language TEXT NOT NULL DEFAULT 'en-US'")
             post_columns = {row["name"] for row in connection.execute("PRAGMA table_info(posts)")}
             if "quoted_post_id" not in post_columns:
                 connection.execute(
@@ -280,9 +294,14 @@ class Database:
                 connection.execute(
                     "ALTER TABLE notifications ADD COLUMN activity_kind TEXT NOT NULL DEFAULT ''"
                 )
-            connection.execute(
-                "UPDATE users SET username = 'member' || id WHERE username IS NULL"
-            )
+            for row in connection.execute("SELECT id FROM users WHERE username IS NULL").fetchall():
+                base = f"member{row['id']}"
+                candidate = base
+                suffix = 0
+                while connection.execute("SELECT 1 FROM users WHERE lower(username)=?", (candidate,)).fetchone():
+                    suffix += 1
+                    candidate = f"{base}_{suffix}"
+                connection.execute("UPDATE users SET username=? WHERE id=?", (candidate, row["id"]))
             connection.commit()
 
     @contextmanager
@@ -302,7 +321,7 @@ class Database:
             row = connection.execute(
                 """SELECT u.id, u.email, u.username, u.created_at, p.display_name, p.bio, p.avatar_filename, p.interests,
                           p.recommendations_consent, p.context_assistance_consent,
-                          p.onboarding_completed, p.terms_accepted_at, p.theme_color
+                          p.onboarding_completed, p.terms_accepted_at, p.theme_color, p.language
                    FROM users u JOIN profiles p ON p.user_id = u.id WHERE u.id = ?""",
                 (user_id,),
             ).fetchone()

@@ -1,4 +1,6 @@
 import base64
+import concurrent.futures
+from contextlib import closing
 import io
 import json
 import os
@@ -6,6 +8,7 @@ import shutil
 import smtplib
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -157,11 +160,36 @@ class AccountApiTests(unittest.TestCase):
         self.client.cookies.clear()
         self.assertEqual(self.client.patch("/api/settings/theme", json={"theme_color": "#123456"}).status_code, 401)
 
+    def test_language_preference_is_account_scoped_and_validated(self):
+        first = self.register()
+        second = self.register("other@example.test", "other", "Other")
+        first_auth = self.auth(first["token"])
+        self.assertEqual(self.client.get("/api/me", headers=first_auth).json()["user"]["language"], "en-US")
+        for language in ("fr-FR", "es-ES", "ar", "hi-IN", "ur"):
+            result = self.client.patch("/api/settings/language", headers=first_auth, json={"language": language})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()["user"]["language"], language)
+            self.assertEqual(self.client.get("/api/me", headers=first_auth).json()["user"]["language"], language)
+        self.assertEqual(self.client.get("/api/me", headers=self.auth(second["token"])).json()["user"]["language"], "en-US")
+        self.assertEqual(self.client.patch("/api/settings/language", headers=first_auth,
+                                          json={"language": "not-a-language"}).status_code, 422)
+        self.assertEqual(self.client.get("/api/me", headers=first_auth).json()["user"]["language"], "ur")
+        login = self.client.post("/api/auth/login", json={
+            "email": "jamie@example.test", "password": "Correct horse battery staple 4!",
+        })
+        self.assertEqual(login.status_code, 200, login.text)
+        self.assertEqual(login.json()["user"]["language"], "ur")
+        self.assertEqual(self.client.get("/api/account/export", headers=first_auth).json()["account"]["language"], "ur")
+        self.assertEqual(self.client.patch("/api/settings/language", headers=first_auth,
+                                          json={"language": "en-US"}).json()["user"]["language"], "en-US")
+        self.client.cookies.clear()
+        self.assertEqual(self.client.patch("/api/settings/language", json={"language": "fr-FR"}).status_code, 401)
+
     def test_game_scores_are_server_calculated_ranked_and_account_owned(self):
         first = self.register()
         second = self.register("other@example.test", "other", "Other")
         first_auth, second_auth = self.auth(first["token"]), self.auth(second["token"])
-        self.assertEqual(len(self.client.get("/api/games", headers=first_auth).json()["games"]), 2)
+        self.assertEqual(len(self.client.get("/api/games", headers=first_auth).json()["games"]), 7)
         self.assertEqual(self.client.post("/api/games/no-such-game/start", headers=first_auth).status_code, 404)
         with mock.patch("zorlii_app.games._holds", return_value=[0, 1, 2]):
             run = self.client.post("/api/games/summit-steps/start", headers=first_auth).json()
@@ -223,6 +251,166 @@ class AccountApiTests(unittest.TestCase):
             for _ in range(30):
                 self.assertTrue(any(abs(hold - lane) <= 1 for hold in games._holds(lane)))
 
+    def test_optional_username_rename_relationships_and_reservations(self):
+        registration = {"email": "new@example.test", "password": "Correct horse battery staple 4!", "accept_terms": True}
+        self.assertEqual(self.client.post("/api/auth/register", json=registration).status_code, 202)
+        code = self.mailer.deliveries[-1]["code"]
+        result = self.client.post("/api/auth/register/verify", json={"email": registration["email"], "code": code}).json()
+        original = result["user"]["username"]
+        self.assertRegex(original, r"^member_[0-9a-f]{12}$")
+        self.assertEqual(result["user"]["display_name"], original)
+        auth = self.auth(result["token"])
+        other = self.register("other@example.test", "other", "Other")
+        other_auth = self.auth(other["token"])
+        self.assertTrue(self.client.post(f"/api/users/{original}/follow", headers=other_auth).json()["following"])
+        self.assertEqual(self.client.patch("/api/profile", headers=auth, json={"username": "OTHER"}).status_code, 409)
+        for invalid in ("a!", "ab", "bad-name", None):
+            self.assertEqual(self.client.patch("/api/profile", headers=auth, json={"username": invalid}).status_code, 422)
+        renamed = self.client.patch("/api/profile", headers=auth, json={"username": "New_Name"})
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(renamed.json()["user"]["username"], "new_name")
+        self.assertEqual(self.client.get("/api/me", headers=auth).json()["user"]["username"], "new_name")
+        self.assertEqual(self.client.get(f"/api/users/{original}", headers=other_auth).status_code, 404)
+        self.assertTrue(self.client.get("/api/users/NEW_NAME", headers=other_auth).json()["user"]["following"])
+        self.assertEqual(self.client.post("/api/posts", headers=other_auth, json={"body": "Hello @NEW_NAME"}).status_code, 201)
+        with self.db.locked_connection() as connection:
+            self.assertTrue(connection.execute("SELECT 1 FROM notifications WHERE user_id=? AND actor_id=?",
+                                               (result["user"]["id"], other["user"]["id"])).fetchone())
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE users SET username='NEW_NAME' WHERE id=?", (other["user"]["id"],))
+            connection.rollback()
+        pending = {**registration, "email": "pending@example.test", "username": "reserved"}
+        self.assertEqual(self.client.post("/api/auth/register", json=pending).status_code, 202)
+        self.assertEqual(self.client.patch("/api/profile", headers=auth, json={"username": "reserved"}).status_code, 409)
+        self.assertEqual(self.client.patch("/api/profile", headers=auth, json={"username": "free_name", "bio": "updated"}).status_code, 200)
+
+    def test_quiz_games_server_scoring_resume_and_invalid_moves(self):
+        account = self.register()
+        auth = self.auth(account["token"])
+        for game in sorted(games.QUIZ_GAMES):
+            with self.subTest(game=game):
+                run = self.client.post(f"/api/games/{game}/start", headers=auth).json()
+                self.assertEqual(run["state"]["round"], 1)
+                self.assertEqual(len(run["state"]["choices"]), 4)
+                self.assertNotIn("_answer", run["state"])
+                invalid = {"run_id": run["run_id"], "revision": 0, "action": "4"}
+                self.assertEqual(self.client.post(f"/api/games/{game}/move", headers=auth, json=invalid).status_code, 400)
+                for revision in range(10):
+                    with self.db.locked_connection() as connection:
+                        stored = json.loads(connection.execute("SELECT state FROM game_runs WHERE user_id=? AND game=?",
+                                                               (account["user"]["id"], game)).fetchone()["state"])
+                    answer = stored["_answer"] if revision != 1 else str((int(stored["_answer"]) + 1) % 4)
+                    payload = {"run_id": run["run_id"], "revision": revision, "action": answer}
+                    response = self.client.post(f"/api/games/{game}/move", headers=auth, json=payload)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    run = response.json()
+                    self.assertEqual(run["state"]["score"], (revision + 1 - int(revision >= 1)) * 10)
+                    self.assertNotIn("_answer", run["state"])
+                    if revision == 0:
+                        self.assertEqual(self.client.post(f"/api/games/{game}/move", headers=auth, json=payload).status_code, 409)
+                        resumed = self.client.get(f"/api/games/{game}/run", headers=auth).json()["run"]
+                        self.assertEqual(resumed["state"], run["state"])
+                        export = self.client.get("/api/account/export", headers=auth).json()
+                        self.assertNotIn("_answer", json.dumps(export))
+                self.assertTrue(run["state"]["over"])
+                self.assertEqual(run["state"]["score"], 90)
+                self.assertEqual(self.client.post(f"/api/games/{game}/move", headers=auth, json={
+                    "run_id": run["run_id"], "revision": 10, "action": "0"}).status_code, 400)
+                scores = self.client.get(f"/api/games/{game}/leaderboard", headers=auth).json()["scores"]
+                self.assertEqual(scores[0]["score"], 90)
+
+    def test_generated_username_retries_existing_and_reserved_names(self):
+        self.register("first@example.test", "member_000000000001", "First")
+        base = {"password": "Correct horse battery staple 4!", "accept_terms": True}
+        self.assertEqual(self.client.post("/api/auth/register", json={
+            **base, "email": "reserved@example.test", "username": "member_000000000002"}).status_code, 202)
+        self.assertEqual(self.client.post("/api/auth/register", json={
+            **base, "email": "generated@example.test"}).status_code, 202)
+        code = self.mailer.deliveries[-1]["code"]
+        with mock.patch("zorlii_app.main.secrets.token_hex", side_effect=["000000000001", "000000000002", "000000000003"]):
+            result = self.client.post("/api/auth/register/verify", json={"email": "generated@example.test", "code": code})
+        self.assertEqual(result.status_code, 201, result.text)
+        self.assertEqual(result.json()["user"]["username"], "member_000000000003")
+
+    def test_simultaneous_renames_are_case_insensitively_unique(self):
+        path = Path(__file__).with_name(f".rename-race-{id(self)}.sqlite3")
+        databases = [Database(path), Database(path)]
+        try:
+            clients = [TestClient(new_app(db, self.mailer, self.avatar_dir, self.media_dir)) for db in databases]
+            tokens = []
+            for index in range(2):
+                email = f"race{index}@example.test"
+                response = clients[0].post("/api/auth/register", json={
+                    "email": email, "username": f"race{index}", "password": "Correct horse battery staple 4!",
+                    "display_name": f"Race {index}", "accept_terms": True})
+                self.assertEqual(response.status_code, 202, response.text)
+                response = clients[0].post("/api/auth/register/verify", json={"email": email, "code": self.mailer.deliveries[-1]["code"]})
+                self.assertEqual(response.status_code, 201, response.text)
+                tokens.append(response.json()["token"])
+            clients[1].get("/api/me", headers=self.auth(tokens[1]))
+            barrier = threading.Barrier(2)
+            def rename(index):
+                barrier.wait(timeout=10)
+                return clients[index].patch("/api/profile", headers=self.auth(tokens[index]),
+                                            json={"username": ("SHARED" if index == 0 else "shared")}).status_code
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(rename, range(2)))
+            self.assertEqual(sorted(results), [200, 409])
+        finally:
+            for db in databases:
+                if db._connection is not None:
+                    db._connection.close()
+            path.unlink(missing_ok=True)
+
+    def test_legacy_case_collisions_and_missing_username_are_preserved(self):
+        path = Path(__file__).with_name(f".username-migration-{id(self)}.sqlite3")
+        db = None
+        try:
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript("""
+                    CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+                                        username TEXT, password_hash TEXT NOT NULL,
+                                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                    INSERT INTO users(id,email,username,password_hash) VALUES
+                        (1,'one@example.test','Alice','hash'),
+                        (2,'two@example.test','alice','hash'),
+                        (3,'three@example.test',NULL,'hash'),
+                        (4,'four@example.test','MEMBER3','hash');
+                """)
+            db = Database(path)
+            with db.locked_connection() as connection:
+                names = [row["username"] for row in connection.execute("SELECT username FROM users ORDER BY id")]
+                self.assertEqual(names, ["Alice", "alice", "member3_1", "MEMBER3"])
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute("UPDATE users SET username='ALICE' WHERE id=4")
+                connection.rollback()
+        finally:
+            if db is not None and db._connection is not None:
+                db._connection.close()
+            path.unlink(missing_ok=True)
+
+    def test_quiz_questions_have_consistent_answers(self):
+        for game in games.QUIZ_GAMES:
+            for _ in range(20):
+                state = games.start(game)
+                labels = [choice["label"] for choice in state["choices"]]
+                self.assertEqual(len(set(labels)), 4)
+                answer = labels[int(state["_answer"])]
+                if game == "quick-math":
+                    a, b = map(int, state["prompt"].removeprefix("What is ").removesuffix("?").split(" + "))
+                    self.assertEqual(int(answer), a + b)
+                elif game == "word-scramble":
+                    self.assertEqual(sorted(answer), sorted(state["prompt"].split(": ")[1]))
+                elif game == "number-pattern":
+                    numbers = list(map(int, state["prompt"].split(": ")[1].removesuffix("?").split(", ")))
+                    self.assertEqual(int(answer), numbers[-1] + numbers[1] - numbers[0])
+                elif game == "color-match":
+                    colors = {"red": "#FF0000", "green": "#00FF00", "blue": "#0000FF",
+                              "yellow": "#FFFF00", "magenta": "#FF00FF", "cyan": "#00FFFF"}
+                    self.assertEqual(answer, colors[state["prompt"].split()[-1].removesuffix("?")])
+                else:
+                    self.assertIn(answer, {"carrot", "dolphin", "trumpet", "cube"})
+
     def test_public_policy_and_account_deletion_pages_are_available(self):
         for path, phrase in (
             ("/privacy", "Privacy Policy"),
@@ -282,6 +470,7 @@ class AccountApiTests(unittest.TestCase):
                 self.assertEqual(user["display_name"], "Existing member")
                 self.assertEqual(user["username"], "member1")
                 self.assertEqual(user["theme_color"], "#a47dff")
+                self.assertEqual(user["language"], "en-US")
                 with migrated.locked_connection() as upgraded:
                     self.assertEqual(upgraded.execute(
                         "SELECT body FROM posts WHERE id=1",
@@ -553,6 +742,146 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(self.mailer.deliveries, [])
         self.assertNotIn("code", response.text.lower())
+
+    def test_edit_posts_and_replies_requires_author_and_preserves_media(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        post = self.client.post("/api/posts", headers=ha, json={"body": "Original @bob"}).json()["post"]
+        post_url = f"/api/posts/{post['id']}"
+        self.client.cookies.clear()
+        self.assertEqual(self.client.patch(post_url, json={"body": "Anonymous"}).status_code, 401)
+        self.assertEqual(self.client.patch(post_url, headers=hb, json={"body": "Not mine"}).status_code, 404)
+        self.assertEqual(self.client.patch(post_url, headers=ha, json={"body": "  "}).status_code, 422)
+        self.assertEqual(self.client.patch(post_url, headers=ha, json={}).status_code, 422)
+        edited = self.client.patch(post_url, headers=ha, json={"body": "  Updated @bob  "})
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertEqual(edited.json()["post"]["body"], "Updated @bob")
+        self.assertEqual(self.client.get(post_url, headers=hb).json()["post"]["body"], "Updated @bob")
+        notifications = self.client.get("/api/notifications", headers=hb).json()["notifications"]
+        self.assertEqual(len([item for item in notifications if item["kind"] == "mention"]), 1)
+
+        media_post = self.client.post(
+            "/api/posts/media", headers=ha, data={"body": "Caption", "visibility": "public"},
+            files={"media": ("test.png", self.image_bytes(), "image/png")},
+        ).json()["post"]
+        edited_media = self.client.patch(
+            f"/api/posts/{media_post['id']}", headers=ha, json={"body": ""},
+        )
+        self.assertEqual(edited_media.status_code, 200, edited_media.text)
+        self.assertEqual(edited_media.json()["post"]["media"], media_post["media"])
+        quote = self.client.post(
+            "/api/posts", headers=ha, json={"body": "Caption", "quoted_post_id": post["id"]},
+        ).json()["post"]
+        edited_quote = self.client.patch(f"/api/posts/{quote['id']}", headers=ha, json={"body": ""})
+        self.assertEqual(edited_quote.status_code, 200, edited_quote.text)
+        self.assertEqual(edited_quote.json()["post"]["quoted_post"]["id"], post["id"])
+
+        reply = self.client.post(
+            f"/api/posts/{post['id']}/replies/media", headers=hb, data={"body": "Reply"},
+            files={"media": ("test.png", self.image_bytes(), "image/png")},
+        ).json()
+        reply_url = f"/api/replies/{reply['id']}"
+        self.assertEqual(self.client.patch(reply_url, headers=ha, json={"body": "Not mine"}).status_code, 404)
+        self.assertEqual(self.client.patch(reply_url, headers=hb, json={"body": "x" * 4001}).status_code, 422)
+        reply_quote = self.client.post(
+            "/api/posts", headers=ha, json={"body": "Quoted reply", "quoted_reply_id": reply["id"]},
+        ).json()["post"]
+        renamed_reply = self.client.patch(reply_url, headers=hb, json={"body": "Updated reply"})
+        self.assertEqual(renamed_reply.status_code, 200, renamed_reply.text)
+        self.assertEqual(
+            self.client.get(f"/api/posts/{reply_quote['id']}", headers=ha).json()["post"]["quoted_reply"]["body"],
+            "Updated reply",
+        )
+        updated_reply = self.client.patch(reply_url, headers=hb, json={"body": ""})
+        self.assertEqual(updated_reply.status_code, 200, updated_reply.text)
+        self.assertEqual(updated_reply.json()["media"], reply["media"])
+        plain = self.client.post(
+            f"/api/posts/{post['id']}/replies", headers=hb, json={"body": "Plain"},
+        ).json()
+        self.assertEqual(self.client.patch(
+            f"/api/replies/{plain['id']}", headers=hb, json={"body": " "},
+        ).status_code, 422)
+
+    def test_edit_notifies_only_new_visible_mentions(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        charlie = self.register("charlie@example.test", "charlie", "Charlie")
+        ha, hb, hc = (self.auth(account["token"]) for account in (alice, bob, charlie))
+        post = self.client.post("/api/posts", headers=ha, json={"body": "Hello @bob"}).json()["post"]
+        result = self.client.patch(
+            f"/api/posts/{post['id']}", headers=ha, json={"body": "@bob and @charlie"},
+        )
+        self.assertEqual(result.status_code, 200, result.text)
+        for headers in (hb, hc):
+            notifications = self.client.get("/api/notifications", headers=headers).json()["notifications"]
+            self.assertEqual(len([item for item in notifications if item["kind"] == "mention"]), 1)
+        private = self.client.post(
+            "/api/posts", headers=ha, json={"body": "Private", "visibility": "private"},
+        ).json()["post"]
+        self.client.patch(f"/api/posts/{private['id']}", headers=ha, json={"body": "Private @charlie"})
+        notifications = self.client.get("/api/notifications", headers=hc).json()["notifications"]
+        self.assertEqual(len([item for item in notifications if item["kind"] == "mention"]), 1)
+        reply = self.client.post(
+            f"/api/posts/{post['id']}/replies", headers=ha, json={"body": "Reply @bob"},
+        ).json()
+        self.assertEqual(self.client.patch(
+            f"/api/replies/{reply['id']}", headers=ha, json={"body": "Reply @bob and @charlie"},
+        ).status_code, 200)
+        for headers in (hb, hc):
+            notifications = self.client.get("/api/notifications", headers=headers).json()["notifications"]
+            reply_mentions = [
+                item for item in notifications
+                if item["kind"] == "mention" and item["reply_id"] == reply["id"]
+            ]
+            self.assertEqual(len(reply_mentions), 1)
+
+    def test_feed_orders_posts_by_creation_not_repost_time(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        self.client.post("/api/users/bob/follow", headers=ha)
+        old = self.client.post("/api/posts", headers=ha, json={"body": "Older"}).json()["post"]
+        new = self.client.post("/api/posts", headers=hb, json={"body": "Newer"}).json()["post"]
+        with self.db.transaction() as connection:
+            connection.execute("UPDATE posts SET created_at=? WHERE id=?", ("2020-01-01 00:00:00", old["id"]))
+            connection.execute("UPDATE posts SET created_at=? WHERE id=?", ("2021-01-01 00:00:00", new["id"]))
+        self.client.post(f"/api/posts/{old['id']}/repost", headers=hb)
+        posts = self.client.get("/api/feed", headers=ha).json()["posts"]
+        self.assertEqual([post["id"] for post in posts], [new["id"], old["id"]])
+        first = self.client.get("/api/feed?limit=1&offset=0", headers=ha).json()["posts"]
+        second = self.client.get("/api/feed?limit=1&offset=1", headers=ha).json()["posts"]
+        self.assertEqual([first[0]["id"], second[0]["id"]], [new["id"], old["id"]])
+
+    def test_deleting_reply_removes_other_users_reposts_and_attached_media(self):
+        alice = self.register()
+        bob = self.register("bob@example.test", "bob", "Bob")
+        ha, hb = self.auth(alice["token"]), self.auth(bob["token"])
+        post = self.client.post("/api/posts", headers=ha, json={"body": "Original"}).json()["post"]
+        reply = self.client.post(
+            f"/api/posts/{post['id']}/replies", headers=hb, json={"body": "Reply"},
+        ).json()
+        quote = self.client.post(
+            "/api/posts", headers=ha, json={"body": "My thought", "quoted_reply_id": reply["id"]},
+        ).json()["post"]
+        self.assertEqual(self.client.post(f"/api/replies/{reply['id']}/repost", headers=ha).status_code, 200)
+        with self.db.locked_connection() as connection:
+            share_id = connection.execute(
+                "SELECT share_post_id FROM reply_reposts WHERE reply_id=?", (reply["id"],),
+            ).fetchone()["share_post_id"]
+        attachment = self.client.post(
+            f"/api/posts/{share_id}/replies/media", headers=ha, data={"body": "Attachment"},
+            files={"media": ("test.png", self.image_bytes(), "image/png")},
+        )
+        self.assertEqual(attachment.status_code, 201, attachment.text)
+        files_before = list(self.media_dir.iterdir())
+        self.assertTrue(files_before)
+        self.assertEqual(self.client.delete(f"/api/replies/{reply['id']}", headers=hb).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/posts/{share_id}", headers=ha).status_code, 404)
+        remaining_quote = self.client.get(f"/api/posts/{quote['id']}", headers=ha).json()["post"]
+        self.assertEqual(remaining_quote["body"], "My thought")
+        self.assertIsNone(remaining_quote["quoted_reply"])
+        self.assertTrue(all(not path.exists() for path in files_before))
 
     def test_social_content_persists_and_private_content_is_authorized(self):
         alice = self.register()
@@ -827,9 +1156,19 @@ class AccountApiTests(unittest.TestCase):
         self.assertEqual(self.client.post(
             "/api/posts", headers=headers, json={"body": "Not accepted yet"},
         ).status_code, 403)
+        language = self.client.patch(
+            "/api/settings/language", headers=headers, json={"language": "fr-FR"},
+        )
+        self.assertEqual(language.status_code, 200, language.text)
+        self.assertEqual(language.json()["user"]["language"], "fr-FR")
+        self.assertFalse(language.json()["user"]["terms_accepted"])
+        self.assertEqual(self.client.post(
+            "/api/posts", headers=headers, json={"body": "Still not accepted"},
+        ).status_code, 403)
         accepted = self.client.post("/api/terms/accept", headers=headers, json={"accepted": True})
         self.assertEqual(accepted.status_code, 200, accepted.text)
         self.assertTrue(accepted.json()["user"]["terms_accepted"])
+        self.assertEqual(accepted.json()["user"]["language"], "fr-FR")
         self.assertEqual(self.client.post(
             "/api/posts", headers=headers, json={"body": "Accepted"},
         ).status_code, 201)
@@ -867,6 +1206,25 @@ class AccountApiTests(unittest.TestCase):
             self.assertEqual(self.client.get(
                 "/api/moderation/reports", headers=reporter_headers,
             ).json()["reports"], [])
+
+    def test_only_configured_moderator_can_remove_unreported_posts(self):
+        creator = self.register()
+        author = self.register("bob@example.test", "bob", "Bob")
+        creator_headers = self.auth(creator["token"])
+        author_headers = self.auth(author["token"])
+        post = self.client.post(
+            "/api/posts", headers=author_headers, json={"body": "An unreported post"},
+        ).json()["post"]
+        with mock.patch.dict(os.environ, {"ZORLII_MODERATOR_EMAILS": "  JAMIE@example.test  "}):
+            self.assertTrue(self.client.get("/api/me", headers=creator_headers).json()["user"]["is_moderator"])
+            self.assertFalse(self.client.get("/api/me", headers=author_headers).json()["user"]["is_moderator"])
+            path = f"/api/moderation/posts/{post['id']}"
+            self.assertEqual(self.client.delete(path, headers=author_headers).status_code, 403)
+            self.assertEqual(self.client.delete(path, headers=creator_headers).status_code, 200)
+            self.assertEqual(self.client.delete(path, headers=creator_headers).status_code, 404)
+        with mock.patch.dict(os.environ, {"ZORLII_MODERATOR_EMAILS": ""}):
+            self.assertFalse(self.client.get("/api/me", headers=creator_headers).json()["user"]["is_moderator"])
+            self.assertEqual(self.client.get("/api/moderation/reports", headers=creator_headers).status_code, 403)
 
     def test_block_hides_profiles_and_posts_and_prevents_private_messages(self):
         alice = self.register()
@@ -967,6 +1325,48 @@ class AccountApiTests(unittest.TestCase):
         })
         self.assertEqual(private_quote.status_code, 201, private_quote.text)
 
+    def test_thread_pages_all_visible_replies(self):
+        author = self.register()
+        blocked = self.register("blocked@example.test", "blocked", "Blocked")
+        headers = self.auth(author["token"])
+        post = self.client.post("/api/posts", headers=headers, json={"body": "Thread root"}).json()["post"]
+        with self.db.transaction() as connection:
+            connection.execute(
+                "INSERT INTO blocked_users(blocker_id,blocked_id) VALUES(?,?)",
+                (author["user"]["id"], blocked["user"]["id"]),
+            )
+            for index in range(105):
+                connection.execute(
+                    "INSERT INTO replies(post_id,user_id,body) VALUES(?,?,?)",
+                    (post["id"], author["user"]["id"], f"Reply {index}"),
+                )
+            connection.execute(
+                "INSERT INTO replies(post_id,user_id,body) VALUES(?,?,?)",
+                (post["id"], blocked["user"]["id"], "Hidden"),
+            )
+        url = f"/api/posts/{post['id']}"
+        default_page = self.client.get(url, headers=headers).json()
+        self.assertEqual(len(default_page["replies"]), 100)
+        self.assertTrue(default_page["has_more"])
+        cursor = None
+        bodies = []
+        while True:
+            params = {"limit": 40}
+            if cursor is not None:
+                params["after_id"] = cursor
+            response = self.client.get(url, headers=headers, params=params)
+            self.assertEqual(response.status_code, 200)
+            page = response.json()
+            bodies.extend(reply["body"] for reply in page["replies"])
+            if not page["has_more"]:
+                self.assertIsNone(page["next_after_id"])
+                break
+            self.assertGreater(page["next_after_id"], cursor or 0)
+            cursor = page["next_after_id"]
+        self.assertEqual(bodies, [f"Reply {index}" for index in range(105)])
+        self.assertEqual(self.client.get(url, headers=headers, params={"after_id": 0}).status_code, 422)
+        self.assertEqual(self.client.get(url, headers=headers, params={"limit": 101}).status_code, 422)
+
     def test_replies_support_media_reactions_reposts_and_quotes(self):
         author = self.register()
         replier = self.register("bob@example.test", "bob", "Bob")
@@ -1012,9 +1412,10 @@ class AccountApiTests(unittest.TestCase):
 
     def test_search_supports_display_names_and_at_usernames(self):
         self.register("bob@example.test", "bob_smith", "Bob Smith")
+        self.register("other@example.test", "bobxsmith", "Other")
         viewer = self.register("eve@example.test", "eve", "Eve")
         headers = self.auth(viewer["token"])
-        for query in ("Bob Smith", "@bob_smith", "bob_smith"):
+        for query in ("Bob Smith", "@bob_", "@bob_smith", "bob_smith"):
             result = self.client.get("/api/search", headers=headers, params={"q": query})
             self.assertEqual(result.status_code, 200, result.text)
             self.assertEqual([person["username"] for person in result.json()["people"]], ["bob_smith"])
@@ -1022,6 +1423,9 @@ class AccountApiTests(unittest.TestCase):
             self.client.get("/api/search", headers=headers, params={"q": "@"}).status_code,
             422,
         )
+        self.assertEqual(self.client.post("/api/users/bob_smith/block", headers=headers).status_code, 200)
+        blocked = self.client.get("/api/search", headers=headers, params={"q": "@bob_"})
+        self.assertEqual(blocked.json()["people"], [])
 
     def test_push_token_registration_and_activity_delivery(self):
         author = self.register()
@@ -1050,6 +1454,60 @@ class AccountApiTests(unittest.TestCase):
             json={"token": push_token, "platform": "android"},
         )
         self.assertEqual(removed.status_code, 204)
+
+    def test_push_errors_are_diagnosable_without_logging_tokens(self):
+        author = self.register()
+        liker = self.register("bob@example.test", "bob", "Bob")
+        author_headers, liker_headers = self.auth(author["token"]), self.auth(liker["token"])
+        token = "ExpoPushToken[0123456789abcdef01234567]"
+        self.assertEqual(self.client.post("/api/push-token", headers=author_headers, json={
+            "token": token, "platform": "android",
+        }).status_code, 204)
+        for result, expected in (
+            (b'{"errors":[{"message":"provider error"}]}', "did not contain a ticket list"),
+            (b'{"data":[{"status":"error","details":{"error":"InvalidCredentials"}}]}', "InvalidCredentials"),
+            (b'{"data":[{"status":"error","details":"invalid"}]}', "Other"),
+        ):
+            post = self.client.post("/api/posts", headers=author_headers, json={"body": "Hello"}).json()["post"]
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = result
+            with mock.patch("zorlii_app.main.urlopen", return_value=response), self.assertLogs("zorlii.push") as logs:
+                self.assertEqual(self.client.post(
+                    f"/api/posts/{post['id']}/reaction", headers=liker_headers,
+                ).status_code, 200)
+            self.assertIn(expected, " ".join(logs.output))
+            self.assertNotIn(token, " ".join(logs.output))
+
+    def test_push_device_not_registered_removes_only_that_token(self):
+        author = self.register()
+        liker = self.register("bob@example.test", "bob", "Bob")
+        author_headers, liker_headers = self.auth(author["token"]), self.auth(liker["token"])
+        tokens = ["ExpoPushToken[0123456789abcdef01234567]", "ExpoPushToken[abcdef0123456789abcdef01]"]
+        for token in tokens:
+            self.assertEqual(self.client.post("/api/push-token", headers=author_headers, json={
+                "token": token, "platform": "android",
+            }).status_code, 204)
+        post = self.client.post("/api/posts", headers=author_headers, json={"body": "Hello"}).json()["post"]
+        def provider_reply(request, timeout):
+            payload = json.loads(request.data)
+            tickets = [
+                {"status": "error", "details": {"error": "DeviceNotRegistered"}}
+                if item["to"] == tokens[0] else {"status": "ok"}
+                for item in payload
+            ]
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps({"data": tickets}).encode()
+            return response
+
+        with mock.patch("zorlii_app.main.urlopen", side_effect=provider_reply):
+            self.assertEqual(self.client.post(
+                f"/api/posts/{post['id']}/reaction", headers=liker_headers,
+            ).status_code, 200)
+        with self.db.locked_connection() as connection:
+            remaining = [row["token"] for row in connection.execute(
+                "SELECT token FROM push_tokens WHERE user_id=?", (author["user"]["id"],)
+            )]
+        self.assertEqual(remaining, [tokens[1]])
 
     def test_local_context_requires_saved_opt_in_and_per_request_confirmation(self):
         member = self.register()
@@ -1226,6 +1684,17 @@ class AccountApiTests(unittest.TestCase):
         empty = self.client.post("/api/posts/media", headers=headers, data={"body": ""})
         self.assertEqual(empty.status_code, 422)
         self.assertEqual(list(self.media_dir.iterdir()), [])
+
+    def test_post_media_detects_images_with_unknown_mime_type(self):
+        alice = self.register()
+        headers = self.auth(alice["token"])
+        for image_format, expected in (("PNG", "image/png"), ("WEBP", "image/webp")):
+            response = self.client.post(
+                "/api/posts/media", headers=headers, data={"body": ""},
+                files=[("media", ("image", self.image_bytes(image_format), "application/octet-stream"))],
+            )
+            self.assertEqual(response.status_code, 201, response.text)
+            self.assertEqual(response.json()["post"]["media"][0]["media_type"], expected)
 
     def test_account_deletion_removes_profile_photo(self):
         alice = self.register()

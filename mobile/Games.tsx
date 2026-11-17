@@ -2,15 +2,30 @@ import React, { useEffect, useRef, useState } from "react";
 import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
 
 type Game = { id: string; name: string; description: string };
-type GameState = { score: number; over: boolean; board?: number[][]; lane?: number; holds?: number[]; deadline?: number };
+type GameChoice = { id: string; label: string };
+type GameState = {
+  score: number;
+  over: boolean;
+  board?: number[][];
+  lane?: number;
+  holds?: number[];
+  deadline?: number;
+  prompt?: string;
+  choices?: GameChoice[];
+  round?: number;
+  total_rounds?: number;
+  correct?: boolean;
+};
 type Run = { run_id: string; revision: number; state: GameState; server_time: number };
 type Score = { username: string; display_name: string; score: number };
 type Scores = { scores: Score[]; has_more: boolean };
+type GameTheme = { accent: string; accentText: string; surface: string; raised: string; border: string; text: string; muted: string };
 
-export default function Games({ apiUrl, token, openProfile }: {
+export default function Games({ apiUrl, token, openProfile, theme }: {
   apiUrl: string;
   token: string;
   openProfile: (username: string) => void;
+  theme: GameTheme;
 }) {
   const [games, setGames] = useState<Game[]>([]);
   const [game, setGame] = useState<Game | null>(null);
@@ -22,6 +37,7 @@ export default function Games({ apiUrl, token, openProfile }: {
   const [scoresLoading, setScoresLoading] = useState(false);
   const [error, setError] = useState("");
   const [remaining, setRemaining] = useState(0);
+  const [rulesAccepted, setRulesAccepted] = useState<Record<string, boolean>>({});
   const busyRef = useRef(false);
   const scoresBusyRef = useRef(false);
   const currentGame = useRef<string | null>(null);
@@ -38,6 +54,18 @@ export default function Games({ apiUrl, token, openProfile }: {
   }
   function showError(value: unknown) {
     setError(value instanceof Error ? value.message : "Something went wrong. Please try again.");
+  }
+  function instructionsFor(id: string) {
+    const instructions: Record<string, string> = {
+      "tile-quest": "Slide tiles in one direction to merge matching numbers. Keep merging to grow your score.",
+      "summit-steps": "Choose a highlighted hold in your lane or an adjacent lane before the 12-second timer ends.",
+      "quick-math": "Solve each math question by choosing one of four answers. You have ten rounds.",
+      "word-scramble": "Unscramble the letters and choose the matching word. You have ten rounds.",
+      "odd-one-out": "Choose the item that does not belong with the others. You have ten rounds.",
+      "number-pattern": "Find the next number in the sequence and choose the correct answer. You have ten rounds.",
+      "color-match": "Choose the color named by the prompt. You have ten rounds.",
+    };
+    return instructions[id] || "Follow the prompt and choose the best answer.";
   }
   useEffect(() => {
     let active = true;
@@ -73,6 +101,7 @@ export default function Games({ apiUrl, token, openProfile }: {
     setBusy(true);
     currentGame.current = selected.id;
     setGame(selected);
+    setRulesAccepted(current => ({ ...current, [selected.id]: current[selected.id] ?? false }));
     setRun(null);
     setRunReady(false);
     setScores([]);
@@ -90,6 +119,7 @@ export default function Games({ apiUrl, token, openProfile }: {
   }
   async function startGame() {
     if (!game || busyRef.current) return;
+    if (!rulesAccepted[game.id]) { setError("Read and acknowledge the game instructions before playing."); return; }
     busyRef.current = true;
     setBusy(true);
     setError("");
@@ -108,7 +138,7 @@ export default function Games({ apiUrl, token, openProfile }: {
     } else { void startGame(); }
   }
   async function move(action: string) {
-    if (!game || !run || busyRef.current) return;
+    if (!game || !run || busyRef.current || !rulesAccepted[game.id]) return;
     busyRef.current = true;
     setBusy(true);
     setError("");
@@ -124,54 +154,73 @@ export default function Games({ apiUrl, token, openProfile }: {
   }
   const button = (label: string, onPress: () => void, disabled = false) =>
     <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress}
-      style={[styles.button, disabled && styles.disabled]}><Text style={styles.buttonText}>{label}</Text></Pressable>;
+      style={[styles.button, { backgroundColor: theme.accent, borderColor: theme.accent }, disabled && styles.disabled]}>
+      <Text style={[styles.buttonText, { color: theme.accentText }]}>{label}</Text>
+    </Pressable>;
 
   return <View>
-    <Text style={styles.eyebrow}>TAKE A LITTLE BREAK</Text>
-    <Text style={styles.title}>{game ? game.name : "Mini games"}</Text>
-    <Text style={styles.copy}>Your best score and username are visible to other members. Games require an internet connection.</Text>
-    {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
-    {!game ? games.map(item => <View key={item.id} style={styles.card}>
-      <Text style={styles.eyebrow}>{item.id === "tile-quest" ? "PUZZLE" : "ADVENTURE"}</Text>
-      <Text style={styles.heading}>{item.name}</Text><Text style={styles.copy}>{item.description}</Text>
+    <Text style={[styles.eyebrow, { color: theme.accent }]}>TAKE A LITTLE BREAK</Text>
+    <Text style={[styles.title, { color: theme.text }]}>{game ? game.name : "Mini games"}</Text>
+    <Text style={[styles.copy, { color: theme.muted }]}>Your best score and username are visible to other members. Games require an internet connection.</Text>
+    {error ? <Text accessibilityRole="alert" style={[styles.error, { color: theme.accent }]}>{error}</Text> : null}
+    {!game ? games.map(item => <View key={item.id} style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+      <Text style={[styles.eyebrow, { color: theme.accent }]}>{item.id === "tile-quest" ? "PUZZLE" : "ADVENTURE"}</Text>
+      <Text style={[styles.heading, { color: theme.text }]}>{item.name}</Text><Text style={[styles.copy, { color: theme.muted }]}>{item.description}</Text>
       {button("Open game", () => { void chooseGame(item); })}
     </View>) : <>
       {button("‹ All games", () => { currentGame.current = null; setGame(null); setRun(null); setError(""); }, busy || scoresLoading)}
-      <View style={styles.card}>
+      <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+        <Text style={[styles.heading, { color: theme.text }]}>How to play</Text>
+        <Text style={[styles.copy, { color: theme.muted }]}>{instructionsFor(game.id)}</Text>
+        <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: Boolean(rulesAccepted[game.id]) }}
+          onPress={() => setRulesAccepted(current => ({ ...current, [game.id]: !current[game.id] }))}
+          style={[styles.rulesCheck, { borderColor: theme.border }]}>
+          <Text style={[styles.rulesCheckText, { color: theme.text }]}>{rulesAccepted[game.id] ? "☑" : "□"}  I have read and understand these instructions.</Text>
+        </Pressable>
         {run ? <>
-          <Text style={styles.heading}>Score · {run.state.score}</Text>
+          <Text style={[styles.heading, { color: theme.text }]}>Score · {run.state.score}</Text>
+          {run.state.round !== undefined && run.state.total_rounds !== undefined
+            ? <Text style={[styles.copy, { color: theme.muted }]}>Round {run.state.round} of {run.state.total_rounds}</Text> : null}
+          {typeof run.state.correct === "boolean" ? <Text accessibilityLiveRegion="polite"
+            style={[styles.copy, { color: run.state.correct ? "#8ce0b1" : theme.muted }]}>{run.state.correct ? "Correct!" : "Not quite. Keep going."}</Text> : null}
+          {run.state.prompt && run.state.choices?.length ? <>
+            <Text accessibilityRole="header" style={[styles.prompt, { color: theme.text }]}>{run.state.prompt}</Text>
+            {!run.state.over ? <View style={styles.choiceList}>{run.state.choices.map(choice =>
+              <React.Fragment key={choice.id}>{button(choice.label, () => { void move(choice.id); }, busy || !rulesAccepted[game.id])}</React.Fragment>)}</View> : null}
+          </> : null}
           {game.id === "tile-quest" && run.state.board ? <>
-            <Text style={styles.copy}>Slide to merge matching tiles.</Text>
+            <Text style={[styles.copy, { color: theme.muted }]}>Slide to merge matching tiles.</Text>
             <View style={styles.board}>{run.state.board.flat().map((value, index) =>
-              <View key={index} accessible accessibilityLabel={value ? `${value}` : "Empty"} style={[styles.tile, value > 0 && styles.tileFilled]}>
-                <Text style={styles.tileText}>{value || ""}</Text>
+              <View key={index} accessible accessibilityLabel={value ? `${value}` : "Empty"}
+                style={[styles.tile, { backgroundColor: theme.raised }, value > 0 && { backgroundColor: theme.accent }]}>
+                <Text style={[styles.tileText, { color: theme.accentText }]}>{value || ""}</Text>
               </View>)}</View>
             {!run.state.over ? <View style={styles.controls}>
               {(["up", "left", "down", "right"] as const).map(direction =>
-                <React.Fragment key={direction}>{button(direction, () => { void move(direction); }, busy)}</React.Fragment>)}
+                <React.Fragment key={direction}>{button(direction, () => { void move(direction); }, busy || !rulesAccepted[game.id])}</React.Fragment>)}
             </View> : null}
           </> : game.id === "summit-steps" && run.state.holds && run.state.lane !== undefined ? <>
-            <Text style={styles.copy}>You are on the {["left", "center", "right"][run.state.lane]} hold. Choose a marked hold in your lane or an adjacent lane within 12 seconds. Missing or running out of time ends your climb.</Text>
-            <View style={styles.cliff} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
-              <View style={styles.cliffRow}>{[0, 1, 2].map(index => <Text key={index} style={styles.cliffMark}>{run.state.holds?.includes(index) ? "◆" : "·"}</Text>)}</View>
-              <View style={styles.cliffRow}>{[0, 1, 2].map(index => <Text key={index} style={styles.cliffMark}>{run.state.lane === index ? "●" : "·"}</Text>)}</View>
+            <Text style={[styles.copy, { color: theme.muted }]}>You are on the {["left", "center", "right"][run.state.lane]} hold. Choose a marked hold in your lane or an adjacent lane within 12 seconds. Missing or running out of time ends your climb.</Text>
+            <View style={[styles.cliff, { backgroundColor: theme.raised, borderColor: theme.border }]} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
+              <View style={styles.cliffRow}>{[0, 1, 2].map(index => <Text key={index} style={[styles.cliffMark, { color: theme.text }]}>{run.state.holds?.includes(index) ? "◆" : "·"}</Text>)}</View>
+              <View style={styles.cliffRow}>{[0, 1, 2].map(index => <Text key={index} style={[styles.cliffMark, { color: theme.text }]}>{run.state.lane === index ? "●" : "·"}</Text>)}</View>
             </View>
-            {!run.state.over ? <Text style={styles.heading}>{remaining ? `${remaining} seconds left` : "Time is up — choose a hold to finish."}</Text> : null}
+            {!run.state.over ? <Text style={[styles.heading, { color: theme.text }]}>{remaining ? `${remaining} seconds left` : "Time is up — choose a hold to finish."}</Text> : null}
             {!run.state.over ? <View style={styles.controls}>{["left", "center", "right"].map((lane, index) =>
-              <React.Fragment key={lane}>{button(`${lane}${run.state.holds?.includes(index) ? " · hold" : ""}`, () => { void move(lane); }, busy)}</React.Fragment>)}</View> : null}
+              <React.Fragment key={lane}>{button(`${lane}${run.state.holds?.includes(index) ? " · hold" : ""}`, () => { void move(lane); }, busy || !rulesAccepted[game.id])}</React.Fragment>)}</View> : null}
           </> : null}
-          {run.state.over ? <Text style={styles.copy}>Game over! Your best score has been saved.</Text> : null}
+          {run.state.over ? <Text style={[styles.copy, { color: theme.muted }]}>Game over! Your best score has been saved.</Text> : null}
         </> : null}
-        {!runReady && !busy ? <Text style={styles.copy}>Return to all games and reopen this game to retry.</Text> : null}
-        {button(run ? "Start over" : "Start playing", confirmStart, busy || !runReady)}
+        {!runReady && !busy ? <Text style={[styles.copy, { color: theme.muted }]}>Return to all games and reopen this game to retry.</Text> : null}
+        {button(run ? "Start over" : "Start playing", confirmStart, busy || !runReady || !rulesAccepted[game.id])}
       </View>
-      <View style={styles.card}><Text style={styles.heading}>Leaderboard</Text>
-        <Text style={styles.copy}>All-time personal bests, highest first.</Text>
+      <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.border }]}><Text style={[styles.heading, { color: theme.text }]}>Leaderboard</Text>
+        <Text style={[styles.copy, { color: theme.muted }]}>All-time personal bests, highest first.</Text>
         {scores.length ? scores.map((score, index) => <Pressable accessibilityRole="link"
-          key={score.username} onPress={() => openProfile(score.username)} style={styles.scoreRow}>
-          <Text style={styles.scoreName}>#{index + 1}  {score.display_name}  @{score.username}</Text>
-          <Text style={styles.scoreValue}>{score.score}</Text>
-        </Pressable>) : <Text style={styles.copy}>{scoresLoading ? "Loading scores…" : error ? "Scores could not be loaded." : "No scores to show yet."}</Text>}
+          key={score.username} onPress={() => openProfile(score.username)} style={[styles.scoreRow, { borderColor: theme.border }]}>
+          <Text style={[styles.scoreName, { color: theme.text }]}>#{index + 1}  {score.display_name}  @{score.username}</Text>
+          <Text style={[styles.scoreValue, { color: theme.accent }]}>{score.score}</Text>
+        </Pressable>) : <Text style={[styles.copy, { color: theme.muted }]}>{scoresLoading ? "Loading scores…" : error ? "Scores could not be loaded." : "No scores to show yet."}</Text>}
         {button("Refresh scores", () => { void loadScores(game.id).catch(showError); }, busy || scoresLoading)}
         {hasMore ? button("Load more", () => { void loadScores(game.id, scores.length).catch(showError); }, busy || scoresLoading) : null}
       </View>
@@ -198,5 +247,9 @@ const styles = StyleSheet.create({
   tileFilled: { backgroundColor: "#61518f" },
   tileText: { color: "#ffffff", fontSize: 19, fontWeight: "800" },
   scoreRow: { flexDirection: "row", justifyContent: "space-between", gap: 8, paddingVertical: 12, borderBottomWidth: 1, borderColor: "#413957" },
+  rulesCheck: { minHeight: 48, justifyContent: "center", paddingHorizontal: 10, borderWidth: 1, borderRadius: 10, marginVertical: 8 },
+  rulesCheckText: { lineHeight: 21 },
+  prompt: { fontSize: 22, fontWeight: "700", lineHeight: 30, marginVertical: 12 },
+  choiceList: { gap: 4, marginVertical: 8 },
   scoreName: { color: "#f5f0ff", flexShrink: 1 }, scoreValue: { color: "#f5f0ff", fontWeight: "700" },
 });

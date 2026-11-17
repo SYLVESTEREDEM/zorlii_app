@@ -17,6 +17,7 @@ data/*.sqlite3
 *.pfx
 *.pem
 *.key
+**/google-services.json
 mobile/node_modules/
 mobile/.expo/
 mobile/dist/

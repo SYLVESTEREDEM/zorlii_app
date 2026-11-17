@@ -2,11 +2,17 @@
   "expo": {
     "name": "Zorlii",
     "slug": "zorlii",
+    "owner": "edds_wiz",
     "scheme": "zorlii",
     "version": "1.0.0",
     "icon": "./assets/zorlii-logo.png",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "extra": {
+      "eas": {
+        "projectId": "8db69131-e4d8-4455-acf0-64dea9dda999"
+      }
+    },
     "plugins": [
       "expo-secure-store",
       [
@@ -24,7 +30,11 @@
     },
     "android": {
       "package": "com.zorlii.app",
+      "versionCode": 9,
       "usesCleartextTraffic": false,
+      "permissions": [
+        "android.permission.POST_NOTIFICATIONS"
+      ],
       "blockedPermissions": [
         "android.permission.RECORD_AUDIO"
       ]

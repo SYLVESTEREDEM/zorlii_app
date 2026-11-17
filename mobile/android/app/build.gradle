@@ -1,6 +1,16 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
+apply plugin: "com.google.gms.google-services"
+
+def googleServicesFile = System.getenv("ZORLII_GOOGLE_SERVICES_FILE")
+if (googleServicesFile) {
+    afterEvaluate {
+        tasks.withType(com.google.gms.googleservices.GoogleServicesTask).configureEach {
+            googleServicesJsonFiles.set([file(googleServicesFile)])
+        }
+    }
+}
 
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
@@ -92,7 +102,7 @@ android {
         applicationId 'com.zorlii.app'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
+        versionCode 9
         versionName "1.0.0"
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
