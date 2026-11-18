@@ -27,7 +27,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from .context_assistance import extractive_context
 from .db import Database
 from .email_delivery import EmailConfigurationError, mailer_from_env
-from . import games
+from . import backup, games
 from .recommendations import recommend
 from .security import hash_password, new_session_token, token_digest, verify_password
 
@@ -2876,3 +2876,4 @@ def new_app(database=None, mailer=None, avatar_directory=None, media_directory=N
 
 
 app = new_app()
+backup.start_backup_thread(DB.path, Path(DB.path).expanduser().parent)
