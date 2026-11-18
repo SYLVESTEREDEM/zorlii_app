@@ -131,3 +131,48 @@ def start_backup_thread(db_path, data_dir, environ=os.environ):
     thread = threading.Thread(target=loop, name="zorlii-backup", daemon=True)
     thread.start()
     return thread
+
+
+def restore_latest(client, bucket, data_dir):
+    """Download the newest database snapshot and all media into data_dir.
+
+    Refuses to overwrite an existing database file. Snapshot names sort by time,
+    so the lexicographically largest db/ key is the newest.
+    """
+    data_dir = Path(data_dir)
+    target = data_dir / "zorlii.sqlite3"
+    if target.exists():
+        raise RuntimeError(f"{target} already exists; restore only into an empty data directory")
+    snapshots = list_keys(client, bucket, "db/")
+    if not snapshots:
+        raise RuntimeError("no database snapshot found in the bucket")
+    latest = max(snapshots)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    client.download_file(bucket, latest, str(target))
+    media_count = 0
+    for folder in MEDIA_FOLDERS:
+        for key in sorted(list_keys(client, bucket, f"{folder}/")):
+            destination = data_dir / key
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            client.download_file(bucket, key, str(destination))
+            media_count += 1
+    return latest, media_count
+
+
+if __name__ == "__main__":
+    import sys
+
+    config = config_from_env()
+    if config is None:
+        sys.exit("ZORLII_BACKUP_BUCKET is not set")
+    import boto3
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=config["endpoint_url"],
+        region_name=config["region_name"],
+        aws_access_key_id=config["aws_access_key_id"],
+        aws_secret_access_key=config["aws_secret_access_key"],
+    )
+    latest, media_count = restore_latest(client, config["bucket"], sys.argv[1])
+    print(f"restored {latest} and {media_count} media files into {sys.argv[1]}")
