@@ -24,6 +24,9 @@ class FakeS3:
     def upload_file(self, filename, bucket, key):
         self.objects[key] = Path(filename).read_bytes()
 
+    def download_file(self, bucket, key, filename):
+        Path(filename).write_bytes(self.objects[key])
+
     def delete_object(self, Bucket, Key):
         self.objects.pop(Key, None)
 
@@ -58,6 +61,30 @@ class BackupTests(unittest.TestCase):
             restored.write_bytes(client.objects[f"db/{stamp}.sqlite3"])
             with sqlite3.connect(restored) as connection:
                 self.assertEqual(connection.execute("SELECT email FROM users").fetchone()[0], "a@example.com")
+
+    def test_restore_latest_snapshot_and_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "live"
+            data.mkdir()
+            with sqlite3.connect(data / "zorlii.sqlite3") as connection:
+                connection.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+                connection.execute("INSERT INTO users(email) VALUES ('kept@example.com')")
+            (data / "media").mkdir()
+            (data / "media" / "m.jpg").write_bytes(b"media")
+            client = FakeS3()
+            now = datetime.now(timezone.utc)
+            backup.run_backup(client, "bucket", data / "zorlii.sqlite3", data, retention_days=14, now=now)
+
+            target = Path(tmp) / "restored"
+            latest, media_count = backup.restore_latest(client, "bucket", target)
+            self.assertEqual(latest, f"db/{now.strftime('%Y%m%dT%H%M%SZ')}.sqlite3")
+            self.assertEqual(media_count, 1)
+            self.assertEqual((target / "media" / "m.jpg").read_bytes(), b"media")
+            with sqlite3.connect(target / "zorlii.sqlite3") as connection:
+                self.assertEqual(connection.execute("SELECT email FROM users").fetchone()[0], "kept@example.com")
+
+            with self.assertRaises(RuntimeError):
+                backup.restore_latest(client, "bucket", target)
 
     def test_disabled_without_bucket(self):
         self.assertIsNone(backup.config_from_env({}))
